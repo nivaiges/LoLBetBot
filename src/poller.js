@@ -23,6 +23,7 @@ import {
   getMatchMessages,
   recordDailyResult,
   getDailyRecord,
+  updatePeakRank,
 } from './db.js';
 
 let client = null;
@@ -253,6 +254,20 @@ async function checkActiveMatches() {
 
     recordDailyResult(match.guild_id, match.puuid, trackedPlayerWon);
     const daily = getDailyRecord(match.guild_id, match.puuid);
+
+    // Update peak rank after match
+    if (trackedPlayerWon) {
+      const rankEntries = await getRankedStatsByPuuid(match.puuid, getRegionForMatch(match));
+      if (rankEntries && !rankEntries.rateLimited && Array.isArray(rankEntries)) {
+        const solo = rankEntries.find(e => e.queueType === 'RANKED_SOLO_5x5');
+        if (solo) {
+          const rv = rankToValue(solo.tier, solo.rank);
+          if (rv !== null) {
+            updatePeakRank(match.guild_id, match.puuid, solo.tier, solo.rank, solo.leaguePoints, rv);
+          }
+        }
+      }
+    }
 
     const bets = getUnresolvedBetsByMatch(match.guild_id, match.match_id);
     const lines = [];

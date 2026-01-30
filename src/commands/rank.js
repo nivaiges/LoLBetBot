@@ -1,6 +1,6 @@
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 import { getRankedStatsByPuuid } from '../riot.js';
-import { getTrackedPlayers, updatePeakRank } from '../db.js';
+import { getTrackedPlayers } from '../db.js';
 import config from '../../config.js';
 
 const TIER_ORDER = [
@@ -49,7 +49,6 @@ export async function execute(interaction) {
       results.push({ tag: player.riot_tag, rank: null });
     } else {
       const value = tierValue(solo.tier, solo.rank, solo.leaguePoints);
-      updatePeakRank(guildId, player.puuid, solo.tier, solo.rank, solo.leaguePoints, value);
       results.push({
         tag: player.riot_tag,
         tier: solo.tier,
