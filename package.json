@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
+    "start:watch": "node --watch-path=src src/index.js",
     "test": "node --test tests/"
   },
   "engines": {

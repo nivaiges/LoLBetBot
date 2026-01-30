@@ -67,12 +67,46 @@ function migrate() {
       UNIQUE(guild_id, match_id, discord_id)
     );
 
+    CREATE TABLE IF NOT EXISTS parley_bets (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id    TEXT NOT NULL,
+      discord_id  TEXT NOT NULL,
+      match_id    TEXT NOT NULL,
+      prediction  TEXT NOT NULL CHECK(prediction IN ('over', 'under')),
+      amount      INTEGER NOT NULL CHECK(amount > 0),
+      placed_at   TEXT NOT NULL DEFAULT (datetime('now')),
+      resolved_at TEXT,
+      outcome     TEXT CHECK(outcome IN ('correct', 'incorrect') OR outcome IS NULL),
+      UNIQUE(guild_id, match_id, discord_id)
+    );
+
     CREATE TABLE IF NOT EXISTS guild_settings (
       guild_id    TEXT PRIMARY KEY,
       channel_id  TEXT NOT NULL,
       updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+
+  // Add parley columns to active_matches if missing
+  const cols = db.prepare("PRAGMA table_info('active_matches')").all().map(c => c.name);
+  if (!cols.includes('parley_stat')) {
+    db.exec(`ALTER TABLE active_matches ADD COLUMN parley_stat TEXT`);
+    db.exec(`ALTER TABLE active_matches ADD COLUMN parley_line REAL`);
+  }
+  if (!cols.includes('message_id')) {
+    db.exec(`ALTER TABLE active_matches ADD COLUMN message_id TEXT`);
+  }
+  if (!cols.includes('close_message_id')) {
+    db.exec(`ALTER TABLE active_matches ADD COLUMN close_message_id TEXT`);
+  }
+
+  // Add daily win/loss tracking to tracked_players
+  const tpCols = db.prepare("PRAGMA table_info('tracked_players')").all().map(c => c.name);
+  if (!tpCols.includes('daily_wins')) {
+    db.exec(`ALTER TABLE tracked_players ADD COLUMN daily_wins INTEGER NOT NULL DEFAULT 0`);
+    db.exec(`ALTER TABLE tracked_players ADD COLUMN daily_losses INTEGER NOT NULL DEFAULT 0`);
+    db.exec(`ALTER TABLE tracked_players ADD COLUMN daily_reset_date TEXT`);
+  }
 }
 
 // ── Query helpers ────────────────────────────────────────────────────────────
@@ -128,6 +162,10 @@ export function getAllTrackedPlayers() {
 
 export function getTrackedPlayerByTag(guildId, riotTag) {
   return db.prepare('SELECT * FROM tracked_players WHERE guild_id = ? AND riot_tag = ? COLLATE NOCASE').get(guildId, riotTag);
+}
+
+export function updateTrackedPlayerPuuid(id, puuid) {
+  return db.prepare('UPDATE tracked_players SET puuid = ? WHERE id = ?').run(puuid, id);
 }
 
 // Active matches
@@ -223,6 +261,80 @@ export function setGuildChannel(guildId, channelId) {
 export function getGuildChannel(guildId) {
   const row = db.prepare('SELECT channel_id FROM guild_settings WHERE guild_id = ?').get(guildId);
   return row?.channel_id || null;
+}
+
+// Parley
+export function setMatchParley(guildId, matchId, stat, line) {
+  db.prepare(`
+    UPDATE active_matches SET parley_stat = ?, parley_line = ?
+    WHERE guild_id = ? AND match_id = ?
+  `).run(stat, line, guildId, matchId);
+}
+
+export function getMatchParley(guildId, matchId) {
+  return db.prepare(`
+    SELECT parley_stat, parley_line FROM active_matches
+    WHERE guild_id = ? AND match_id = ?
+  `).get(guildId, matchId);
+}
+
+export function placeParleyBet(guildId, discordId, matchId, prediction, amount) {
+  return db.prepare(`
+    INSERT INTO parley_bets (guild_id, discord_id, match_id, prediction, amount)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(guildId, discordId, matchId, prediction, amount);
+}
+
+export function getUserParleyBetOnMatch(guildId, discordId, matchId) {
+  return db.prepare(`
+    SELECT * FROM parley_bets WHERE guild_id = ? AND discord_id = ? AND match_id = ?
+  `).get(guildId, discordId, matchId);
+}
+
+export function getUnresolvedParleyBetsByMatch(guildId, matchId) {
+  return db.prepare(`
+    SELECT * FROM parley_bets WHERE guild_id = ? AND match_id = ? AND outcome IS NULL
+  `).all(guildId, matchId);
+}
+
+export function resolveParleyBet(betId, outcome) {
+  db.prepare(`
+    UPDATE parley_bets SET outcome = ?, resolved_at = datetime('now') WHERE id = ?
+  `).run(outcome, betId);
+}
+
+// Message tracking
+export function setMatchMessageId(guildId, matchId, messageId) {
+  db.prepare('UPDATE active_matches SET message_id = ? WHERE guild_id = ? AND match_id = ?').run(messageId, guildId, matchId);
+}
+
+export function setMatchCloseMessageId(guildId, matchId, messageId) {
+  db.prepare('UPDATE active_matches SET close_message_id = ? WHERE guild_id = ? AND match_id = ?').run(messageId, guildId, matchId);
+}
+
+export function getMatchMessages(guildId, matchId) {
+  return db.prepare('SELECT message_id, close_message_id FROM active_matches WHERE guild_id = ? AND match_id = ?').get(guildId, matchId);
+}
+
+// Daily win/loss tracking
+export function recordDailyResult(guildId, puuid, won) {
+  const today = new Date().toISOString().slice(0, 10);
+  const player = db.prepare('SELECT daily_reset_date FROM tracked_players WHERE guild_id = ? AND puuid = ?').get(guildId, puuid);
+  if (player?.daily_reset_date !== today) {
+    db.prepare('UPDATE tracked_players SET daily_wins = 0, daily_losses = 0, daily_reset_date = ? WHERE guild_id = ? AND puuid = ?').run(today, guildId, puuid);
+  }
+  if (won) {
+    db.prepare('UPDATE tracked_players SET daily_wins = daily_wins + 1 WHERE guild_id = ? AND puuid = ?').run(guildId, puuid);
+  } else {
+    db.prepare('UPDATE tracked_players SET daily_losses = daily_losses + 1 WHERE guild_id = ? AND puuid = ?').run(guildId, puuid);
+  }
+}
+
+export function getDailyRecord(guildId, puuid) {
+  const today = new Date().toISOString().slice(0, 10);
+  const player = db.prepare('SELECT daily_wins, daily_losses, daily_reset_date FROM tracked_players WHERE guild_id = ? AND puuid = ?').get(guildId, puuid);
+  if (!player || player.daily_reset_date !== today) return { wins: 0, losses: 0 };
+  return { wins: player.daily_wins, losses: player.daily_losses };
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────

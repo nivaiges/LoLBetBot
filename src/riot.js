@@ -5,9 +5,15 @@ const RIOT_KEY = process.env.RIOT_API_KEY;
 
 async function riotFetch(url) {
   logger.debug({ url }, 'Riot API request');
-  const res = await fetch(url, {
-    headers: { 'X-Riot-Token': RIOT_KEY },
-  });
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: { 'X-Riot-Token': RIOT_KEY },
+    });
+  } catch (err) {
+    logger.error({ err: err.message, url }, 'Riot API network error');
+    return null;
+  }
 
   if (res.status === 429) {
     const retryAfter = res.headers.get('Retry-After') || '10';
@@ -68,4 +74,9 @@ export async function getSummonerByPuuid(puuid, platform) {
 export async function getRankedStats(summonerId, platform) {
   const base = config.platformUrl(platform || config.riotRegion);
   return riotFetch(`${base}/lol/league/v4/entries/by-summoner/${summonerId}`);
+}
+
+export async function getRankedStatsByPuuid(puuid, platform) {
+  const base = config.platformUrl(platform || config.riotRegion);
+  return riotFetch(`${base}/lol/league/v4/entries/by-puuid/${puuid}`);
 }

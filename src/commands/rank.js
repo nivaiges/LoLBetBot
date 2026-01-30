@@ -1,55 +1,81 @@
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
-import { getAccountByRiotId, getSummonerByPuuid, getRankedStats } from '../riot.js';
-import config from '../../config.js';
+import { getRankedStatsByPuuid } from '../riot.js';
+import { getTrackedPlayers } from '../db.js';
+
+const TIER_ORDER = [
+  'CHALLENGER', 'GRANDMASTER', 'MASTER',
+  'DIAMOND', 'EMERALD', 'PLATINUM', 'GOLD',
+  'SILVER', 'BRONZE', 'IRON',
+];
+const RANK_ORDER = ['I', 'II', 'III', 'IV'];
+
+function tierValue(tier, rank, lp) {
+  const t = TIER_ORDER.indexOf(tier);
+  const r = RANK_ORDER.indexOf(rank);
+  // Lower index = higher rank. Invert so higher value = better.
+  return (TIER_ORDER.length - t) * 10000 + (RANK_ORDER.length - r) * 100 + lp;
+}
 
 export const data = new SlashCommandBuilder()
   .setName('rank')
-  .setDescription('Show a player\'s Solo/Duo rank')
-  .addStringOption(opt =>
-    opt.setName('riot_id')
-      .setDescription('Riot ID in GameName#TagLine format (e.g. Nivy#NA1)')
-      .setRequired(true)
-  );
+  .setDescription('Show ranks of all tracked players');
 
 export async function execute(interaction) {
-  const riotId = interaction.options.getString('riot_id');
-  const parts = riotId.split('#');
-  if (parts.length !== 2 || !parts[0] || !parts[1]) {
-    return interaction.reply({ content: 'Invalid format. Use `GameName#TagLine`.', ephemeral: true });
+  const guildId = interaction.guildId;
+  const players = getTrackedPlayers(guildId);
+
+  if (!players.length) {
+    return interaction.reply({ content: 'No tracked players. Use `/adduser` to add some.', ephemeral: true });
   }
 
   await interaction.deferReply();
 
-  const [gameName, tagLine] = parts;
-  const region = config.riotRegion;
+  const results = [];
 
-  const account = await getAccountByRiotId(gameName, tagLine, region);
-  if (!account || account.rateLimited) {
-    return interaction.editReply(account?.rateLimited ? 'Riot API rate limited.' : `Account **${riotId}** not found.`);
+  for (const player of players) {
+    const entries = await getRankedStatsByPuuid(player.puuid, player.region);
+    if (!entries || entries.rateLimited) {
+      if (entries?.rateLimited) {
+        results.push({ tag: player.riot_tag, rank: null, error: 'Rate limited' });
+        break;
+      }
+      results.push({ tag: player.riot_tag, rank: null });
+      continue;
+    }
+
+    const solo = Array.isArray(entries) && entries.find(e => e.queueType === 'RANKED_SOLO_5x5');
+    if (!solo) {
+      results.push({ tag: player.riot_tag, rank: null });
+    } else {
+      results.push({
+        tag: player.riot_tag,
+        rank: `${solo.tier} ${solo.rank}`,
+        lp: solo.leaguePoints,
+        record: `${solo.wins}W / ${solo.losses}L`,
+        value: tierValue(solo.tier, solo.rank, solo.leaguePoints),
+      });
+    }
   }
 
-  const summoner = await getSummonerByPuuid(account.puuid, region);
-  if (!summoner || summoner.rateLimited) {
-    return interaction.editReply('Could not fetch summoner data.');
-  }
+  // Sort ranked players first (by value desc), then unranked at bottom
+  results.sort((a, b) => {
+    if (a.value != null && b.value != null) return b.value - a.value;
+    if (a.value != null) return -1;
+    if (b.value != null) return 1;
+    return 0;
+  });
 
-  const entries = await getRankedStats(summoner.id, region);
-  if (!entries || entries.rateLimited) {
-    return interaction.editReply('Could not fetch ranked data.');
-  }
-
-  const solo = Array.isArray(entries) && entries.find(e => e.queueType === 'RANKED_SOLO_5x5');
-  if (!solo) {
-    return interaction.editReply(`**${riotId}** is unranked in Solo/Duo.`);
-  }
+  const lines = results.map((r, i) => {
+    const pos = `${i + 1}.`;
+    if (r.rank) {
+      return `${pos} **${r.tag}** — ${r.rank} (${r.lp} LP) • ${r.record}`;
+    }
+    return `${pos} **${r.tag}** — Unranked`;
+  });
 
   const embed = new EmbedBuilder()
-    .setTitle(`${riotId} — Solo/Duo`)
-    .addFields(
-      { name: 'Rank', value: `${solo.tier} ${solo.rank}`, inline: true },
-      { name: 'LP', value: `${solo.leaguePoints}`, inline: true },
-      { name: 'Record', value: `${solo.wins}W / ${solo.losses}L`, inline: true },
-    )
+    .setTitle('Tracked Players — Solo/Duo Ranks')
+    .setDescription(lines.join('\n'))
     .setColor(0x9b59b6);
 
   return interaction.editReply({ embeds: [embed] });

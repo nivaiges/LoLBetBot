@@ -62,7 +62,11 @@ const config = {
   bettingWindowMs: 3 * 60 * 1000, // 3 minutes
 
   // Bet payout multiplier
-  payoutMultiplier: 2,
+  payoutMultiplier: 1.5,
+
+  // Parley (over/under stat bets)
+  parleyChance: 0.1,          // 10% of matches get a parley
+  parleyPayoutMultiplier: 2,
 };
 
 export default config;

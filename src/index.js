@@ -12,8 +12,14 @@ import {
   getUserBetOnMatch,
   deductCoins,
   placeBet,
+  getMatchParley,
+  getUserParleyBetOnMatch,
+  placeParleyBet,
+  getAllTrackedPlayers,
+  updateTrackedPlayerPuuid,
 } from './db.js';
 import config from '../config.js';
+import { getAccountByRiotId } from './riot.js';
 import { isBettingOpen } from './utils/bettingwindow.js';
 
 // Import commands
@@ -64,9 +70,28 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
+async function refreshPuuids() {
+  const players = getAllTrackedPlayers();
+  logger.info({ count: players.length }, 'Refreshing tracked player PUUIDs for new API key');
+  for (const player of players) {
+    const parts = player.riot_tag.split('#');
+    if (parts.length !== 2) continue;
+    const account = await getAccountByRiotId(parts[0], parts[1], player.region);
+    if (!account || account.rateLimited) {
+      logger.warn({ riotTag: player.riot_tag }, 'Could not refresh PUUID');
+      continue;
+    }
+    if (account.puuid !== player.puuid) {
+      updateTrackedPlayerPuuid(player.id, account.puuid);
+      logger.info({ riotTag: player.riot_tag }, 'Updated PUUID');
+    }
+  }
+}
+
 client.once('ready', async () => {
   logger.info({ user: client.user.tag, guilds: client.guilds.cache.size }, 'Bot is online');
   await registerCommands(client.user.id);
+  await refreshPuuids();
   startPoller(client);
 });
 
@@ -94,88 +119,164 @@ client.on('interactionCreate', async (interaction) => {
     return;
   }
 
-  // ── Button clicks (bet_win / bet_lose) ───────────────────────────────────
+  // ── Button clicks (bet_win / bet_lose / parley_over / parley_under) ─────
   if (interaction.isButton()) {
     const id = interaction.customId;
-    if (!id.startsWith('bet_win_') && !id.startsWith('bet_lose_')) return;
 
-    // Parse: bet_{prediction}_{matchId}
-    const prediction = id.startsWith('bet_win_') ? 'win' : 'lose';
-    const matchId = id.startsWith('bet_win_') ? id.slice('bet_win_'.length) : id.slice('bet_lose_'.length);
+    // Win/Lose bet buttons
+    if (id.startsWith('bet_win_') || id.startsWith('bet_lose_')) {
+      const prediction = id.startsWith('bet_win_') ? 'win' : 'lose';
+      const matchId = id.startsWith('bet_win_') ? id.slice('bet_win_'.length) : id.slice('bet_lose_'.length);
 
-    // Check betting window
-    if (!isBettingOpen(matchId)) {
-      return interaction.reply({ content: '🔒 Betting is closed for this match.', ephemeral: true });
+      if (!isBettingOpen(matchId)) {
+        return interaction.reply({ content: '🔒 Betting is closed for this match.', ephemeral: true });
+      }
+
+      const modal = new ModalBuilder()
+        .setCustomId(`betmodal_${prediction}_${matchId}`)
+        .setTitle(`Bet ${prediction.toUpperCase()} — Enter Amount`);
+
+      const amountInput = new TextInputBuilder()
+        .setCustomId('bet_amount')
+        .setLabel('How many coins do you want to bet?')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('e.g. 5000')
+        .setRequired(true);
+
+      modal.addComponents(new ActionRowBuilder().addComponents(amountInput));
+      await interaction.showModal(modal);
+      return;
     }
 
-    // Show modal to ask for amount
-    const modal = new ModalBuilder()
-      .setCustomId(`betmodal_${prediction}_${matchId}`)
-      .setTitle(`Bet ${prediction.toUpperCase()} — Enter Amount`);
+    // Parley over/under buttons
+    if (id.startsWith('parley_over_') || id.startsWith('parley_under_')) {
+      const prediction = id.startsWith('parley_over_') ? 'over' : 'under';
+      const matchId = id.startsWith('parley_over_') ? id.slice('parley_over_'.length) : id.slice('parley_under_'.length);
 
-    const amountInput = new TextInputBuilder()
-      .setCustomId('bet_amount')
-      .setLabel('How many coins do you want to bet?')
-      .setStyle(TextInputStyle.Short)
-      .setPlaceholder('e.g. 5000')
-      .setRequired(true);
+      if (!isBettingOpen(matchId)) {
+        return interaction.reply({ content: '🔒 Betting is closed for this match.', ephemeral: true });
+      }
 
-    modal.addComponents(new ActionRowBuilder().addComponents(amountInput));
-    await interaction.showModal(modal);
+      const parley = getMatchParley(interaction.guildId, matchId);
+      if (!parley?.parley_stat) {
+        return interaction.reply({ content: '❌ No parley available for this match.', ephemeral: true });
+      }
+
+      const modal = new ModalBuilder()
+        .setCustomId(`parleymodal_${prediction}_${matchId}`)
+        .setTitle(`Parley ${prediction.toUpperCase()} — Enter Amount`);
+
+      const amountInput = new TextInputBuilder()
+        .setCustomId('bet_amount')
+        .setLabel('How many coins do you want to bet?')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('e.g. 5000')
+        .setRequired(true);
+
+      modal.addComponents(new ActionRowBuilder().addComponents(amountInput));
+      await interaction.showModal(modal);
+      return;
+    }
+
     return;
   }
 
-  // ── Modal submit (bet amount) ────────────────────────────────────────────
+  // ── Modal submit (bet amount / parley amount) ──────────────────────────
   if (interaction.isModalSubmit()) {
     const id = interaction.customId;
-    if (!id.startsWith('betmodal_')) return;
 
-    // Parse: betmodal_{prediction}_{matchId}
-    const prediction = id.split('_')[1];
-    const matchId = id.slice(`betmodal_${prediction}_`.length);
+    // Win/Lose bet modal
+    if (id.startsWith('betmodal_')) {
+      const prediction = id.split('_')[1];
+      const matchId = id.slice(`betmodal_${prediction}_`.length);
 
-    const amountStr = interaction.fields.getTextInputValue('bet_amount');
-    const amount = parseInt(amountStr, 10);
+      const amountStr = interaction.fields.getTextInputValue('bet_amount');
+      const amount = parseInt(amountStr, 10);
 
-    if (isNaN(amount) || amount <= 0) {
-      return interaction.reply({ content: '❌ Enter a valid positive number.', ephemeral: true });
+      if (isNaN(amount) || amount <= 0) {
+        return interaction.reply({ content: '❌ Enter a valid positive number.', ephemeral: true });
+      }
+
+      const guildId = interaction.guildId;
+      const userId = interaction.user.id;
+
+      if (!isBettingOpen(matchId)) {
+        return interaction.reply({ content: '🔒 Betting closed while you were entering your amount.', ephemeral: true });
+      }
+
+      const match = getActiveMatchByMatchId(guildId, matchId);
+      if (!match) {
+        return interaction.reply({ content: '❌ This match is no longer active.', ephemeral: true });
+      }
+
+      const user = ensureUser(guildId, userId);
+
+      if (user.coins < amount) {
+        return interaction.reply({ content: `💰 Insufficient coins. You have **${user.coins.toLocaleString()}** 🪙.`, ephemeral: true });
+      }
+
+      const existing = getUserBetOnMatch(guildId, userId, matchId);
+      if (existing) {
+        return interaction.reply({ content: `⚠️ You already bet **${existing.prediction.toUpperCase()}** (${existing.amount.toLocaleString()} 🪙) on this match.`, ephemeral: true });
+      }
+
+      deductCoins(guildId, userId, amount);
+      placeBet(guildId, userId, matchId, match.puuid, prediction, amount);
+
+      const emoji = prediction === 'win' ? '🟢' : '🔴';
+      return interaction.reply(
+        `${emoji} **${interaction.user.username}** bet **${prediction.toUpperCase()}** for **${amount.toLocaleString()}** 🪙`
+      );
     }
 
-    const guildId = interaction.guildId;
-    const userId = interaction.user.id;
+    // Parley modal
+    if (id.startsWith('parleymodal_')) {
+      const prediction = id.split('_')[1];
+      const matchId = id.slice(`parleymodal_${prediction}_`.length);
 
-    // Check betting window again
-    if (!isBettingOpen(matchId)) {
-      return interaction.reply({ content: '🔒 Betting closed while you were entering your amount.', ephemeral: true });
+      const amountStr = interaction.fields.getTextInputValue('bet_amount');
+      const amount = parseInt(amountStr, 10);
+
+      if (isNaN(amount) || amount <= 0) {
+        return interaction.reply({ content: '❌ Enter a valid positive number.', ephemeral: true });
+      }
+
+      const guildId = interaction.guildId;
+      const userId = interaction.user.id;
+
+      if (!isBettingOpen(matchId)) {
+        return interaction.reply({ content: '🔒 Betting closed while you were entering your amount.', ephemeral: true });
+      }
+
+      const match = getActiveMatchByMatchId(guildId, matchId);
+      if (!match) {
+        return interaction.reply({ content: '❌ This match is no longer active.', ephemeral: true });
+      }
+
+      const parley = getMatchParley(guildId, matchId);
+      if (!parley?.parley_stat) {
+        return interaction.reply({ content: '❌ No parley available for this match.', ephemeral: true });
+      }
+
+      const user = ensureUser(guildId, userId);
+
+      if (user.coins < amount) {
+        return interaction.reply({ content: `💰 Insufficient coins. You have **${user.coins.toLocaleString()}** 🪙.`, ephemeral: true });
+      }
+
+      const existing = getUserParleyBetOnMatch(guildId, userId, matchId);
+      if (existing) {
+        return interaction.reply({ content: `⚠️ You already placed a parley bet (**${existing.prediction.toUpperCase()}**, ${existing.amount.toLocaleString()} 🪙) on this match.`, ephemeral: true });
+      }
+
+      deductCoins(guildId, userId, amount);
+      placeParleyBet(guildId, userId, matchId, prediction, amount);
+
+      const emoji = prediction === 'over' ? '⬆️' : '⬇️';
+      return interaction.reply(
+        `${emoji} **${interaction.user.username}** parley bet **${prediction.toUpperCase()}** for **${amount.toLocaleString()}** 🪙`
+      );
     }
-
-    // Check match is still active
-    const match = getActiveMatchByMatchId(guildId, matchId);
-    if (!match) {
-      return interaction.reply({ content: '❌ This match is no longer active.', ephemeral: true });
-    }
-
-    const user = ensureUser(guildId, userId);
-
-    // Check balance
-    if (user.coins < amount) {
-      return interaction.reply({ content: `💰 Insufficient coins. You have **${user.coins.toLocaleString()}** 🪙.`, ephemeral: true });
-    }
-
-    // Check duplicate
-    const existing = getUserBetOnMatch(guildId, userId, matchId);
-    if (existing) {
-      return interaction.reply({ content: `⚠️ You already bet **${existing.prediction.toUpperCase()}** (${existing.amount.toLocaleString()} 🪙) on this match.`, ephemeral: true });
-    }
-
-    // Place bet (puuid comes from the active match record)
-    deductCoins(guildId, userId, amount);
-    placeBet(guildId, userId, matchId, match.puuid, prediction, amount);
-
-    const emoji = prediction === 'win' ? '🟢' : '🔴';
-    return interaction.reply(
-      `${emoji} **${interaction.user.username}** bet **${prediction.toUpperCase()}** for **${amount.toLocaleString()}** 🪙`
-    );
   }
 });
 
