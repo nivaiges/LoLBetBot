@@ -66,7 +66,7 @@ const config = {
   losePayoutMultiplier: 3,     // LOSE bets pay 3x
 
   // Parley (over/under stat bets)
-  parleyChance: 0.1,          // 10% of matches get a parley
+  parleyChance: 0.175,        // 17.5% of matches get a parley
   parleyPayoutMultiplier: 2,
 
   // Custom rank emoji — upload rank icons to your server, then paste emoji IDs here.

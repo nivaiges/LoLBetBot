@@ -3,6 +3,33 @@ import logger from './utils/logger.js';
 
 const RIOT_KEY = process.env.RIOT_API_KEY;
 
+// ── Data Dragon: champion ID → name mapping ─────────────────────────────────
+let championMap = null;
+
+export async function loadChampionMap() {
+  if (championMap) return;
+  try {
+    const verRes = await fetch('https://ddragon.leagueoflegends.com/api/versions.json');
+    const versions = await verRes.json();
+    const latest = versions[0];
+    const champRes = await fetch(`https://ddragon.leagueoflegends.com/cdn/${latest}/data/en_US/champion.json`);
+    const champData = await champRes.json();
+    championMap = {};
+    for (const champ of Object.values(champData.data)) {
+      championMap[parseInt(champ.key)] = champ.name;
+    }
+    logger.info({ version: latest, count: Object.keys(championMap).length }, 'Loaded champion data from Data Dragon');
+  } catch (err) {
+    logger.error({ err: err.message }, 'Failed to load champion data from Data Dragon');
+    championMap = {};
+  }
+}
+
+export function getChampionName(championId) {
+  if (!championMap) return `Champ ${championId}`;
+  return championMap[championId] || `Champ ${championId}`;
+}
+
 async function riotFetch(url) {
   logger.debug({ url }, 'Riot API request');
   let res;

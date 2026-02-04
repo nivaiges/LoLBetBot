@@ -284,9 +284,17 @@ client.on('interactionCreate', async (interaction) => {
       deductCoins(guildId, userId, amount);
       placeParleyBet(guildId, userId, matchId, prediction, amount);
 
-      const emoji = prediction === 'over' ? '⬆️' : '⬇️';
+      const isYesNo = parley.parley_stat === 'firstBlood' || parley.parley_stat === 'tripleKill';
+      let betEmoji, displayPrediction;
+      if (isYesNo) {
+        betEmoji = prediction === 'over' ? '✅' : '❌';
+        displayPrediction = prediction === 'over' ? 'YES' : 'NO';
+      } else {
+        betEmoji = prediction === 'over' ? '⬆️' : '⬇️';
+        displayPrediction = prediction.toUpperCase();
+      }
       return interaction.reply(
-        `${emoji} **${interaction.user.username}** parley bet **${prediction.toUpperCase()}** for **${amount.toLocaleString()}** 🪙`
+        `${betEmoji} **${interaction.user.username}** parley bet **${displayPrediction}** for **${amount.toLocaleString()}** 🪙`
       );
     }
   }

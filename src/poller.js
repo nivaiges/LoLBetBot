@@ -1,7 +1,7 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } from 'discord.js';
 import config from '../config.js';
 import logger from './utils/logger.js';
-import { getActiveGame, getMatchResult, getRankedStatsByPuuid } from './riot.js';
+import { getActiveGame, getMatchResult, getRankedStatsByPuuid, loadChampionMap, getChampionName } from './riot.js';
 import { registerBettingWindow } from './utils/bettingwindow.js';
 import {
   getAllTrackedPlayers,
@@ -13,7 +13,6 @@ import {
   updateUserStats,
   touchMatch,
   getGuildChannel,
-  getActiveMatchByMatchId,
   setMatchParley,
   getMatchParley,
   getUnresolvedParleyBetsByMatch,
@@ -36,8 +35,9 @@ import {
 let client = null;
 let pollTimer = null;
 
-export function startPoller(discordClient) {
+export async function startPoller(discordClient) {
   client = discordClient;
+  await loadChampionMap();
   logger.info({ intervalMs: config.pollIntervalMs }, 'Starting match poller');
   pollTimer = setInterval(pollTick, config.pollIntervalMs);
   pollTick();
@@ -65,6 +65,20 @@ function getDisplayName(riotTag) {
 
 const TIERS = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'MASTER', 'GRANDMASTER', 'CHALLENGER'];
 const DIVISIONS = ['IV', 'III', 'II', 'I'];
+
+const PARLEY_POOL = [
+  { stat: 'kills', label: 'Kills', type: 'ou', min: 3.5, max: 8.5, step: 1 },
+  { stat: 'deaths', label: 'Deaths', type: 'ou', min: 2.5, max: 6.5, step: 1 },
+  { stat: 'kda', label: 'KDA', type: 'ou', min: 1.5, max: 4.5, step: 0.5 },
+  { stat: 'cs', label: 'CS', type: 'ou', min: 120.5, max: 220.5, step: 10 },
+  { stat: 'visionScore', label: 'Vision Score', type: 'ou', min: 15.5, max: 40.5, step: 5 },
+  { stat: 'gameLength', label: 'Game Length (min)', type: 'ou', min: 22.5, max: 35.5, step: 1 },
+  { stat: 'firstBlood', label: 'First Blood', type: 'yesno' },
+  { stat: 'tripleKill', label: 'Triple Kill', type: 'yesno' },
+];
+
+const YES_NO_STATS = new Set(PARLEY_POOL.filter(p => p.type === 'yesno').map(p => p.stat));
+const PARLEY_LABELS = Object.fromEntries(PARLEY_POOL.map(p => [p.stat, p.label]));
 
 function rankToValue(tier, division) {
   const tierIdx = TIERS.indexOf(tier);
@@ -147,33 +161,53 @@ async function checkForNewMatches() {
       logger.info({ guildId: player.guild_id, riotTag: player.riot_tag, matchId }, 'New active match detected');
       registerBettingWindow(matchId);
 
-      const avgRank = await getAverageRank(game.participants || [], player.region, player.guild_id);
+      const participants = game.participants || [];
+      const avgRank = await getAverageRank(participants, player.region, player.guild_id);
 
-      // Roll for parley (over/under stat bet)
+      // Identify tracked player's team and build team displays
+      const trackedP = participants.find(p => p.puuid === player.puuid);
+      const trackedTeamId = trackedP?.teamId || 100;
+      const trackedChamp = trackedP ? getChampionName(trackedP.championId) : null;
+      const sideLabel = trackedTeamId === 100 ? '🔵 Blue Side' : '🔴 Red Side';
+      const allies = participants.filter(p => p.teamId === trackedTeamId);
+      const enemies = participants.filter(p => p.teamId !== trackedTeamId);
+      const formatTeam = (team) => team.map(p => getChampionName(p.championId)).join(', ');
+
+      // Roll for parley (over/under or yes/no stat bet)
       const hasParley = Math.random() < config.parleyChance;
       let parleyField = null;
       if (hasParley) {
-        const stats = ['kills', 'deaths', 'kda'];
-        const stat = stats[Math.floor(Math.random() * stats.length)];
-        const ranges = { kills: [3.5, 8.5], deaths: [2.5, 6.5], kda: [1.5, 4.5] };
-        const [min, max] = ranges[stat];
-        const steps = Math.round((max - min) / (stat === 'kda' ? 0.5 : 1));
-        const line = min + Math.floor(Math.random() * (steps + 1)) * (stat === 'kda' ? 0.5 : 1);
-        setMatchParley(player.guild_id, matchId, stat, line);
-        const label = stat === 'kda' ? 'KDA' : stat.charAt(0).toUpperCase() + stat.slice(1);
-        parleyField = { stat, line, label };
-        logger.info({ matchId, stat, line }, 'Parley generated for match');
+        const pick = PARLEY_POOL[Math.floor(Math.random() * PARLEY_POOL.length)];
+        let line;
+        if (pick.type === 'yesno') {
+          line = 0.5;
+        } else {
+          const steps = Math.round((pick.max - pick.min) / pick.step);
+          line = pick.min + Math.floor(Math.random() * (steps + 1)) * pick.step;
+        }
+        setMatchParley(player.guild_id, matchId, pick.stat, line);
+        parleyField = { stat: pick.stat, line, label: pick.label, type: pick.type };
+        logger.info({ matchId, stat: pick.stat, line, type: pick.type }, 'Parley generated for match');
       }
 
+      const titleChamp = trackedChamp ? ` — playing ${trackedChamp}` : '';
       const embed = new EmbedBuilder()
         .setTitle('🎮 Match Detected!')
-        .setDescription(`**${name}** just entered a match!\n\n⏰ Betting closes in **5 minutes** — place your bets!\n🟢 WIN pays **${config.payoutMultiplier}x** · 🔴 LOSE pays **${config.losePayoutMultiplier}x**`)
-        .addFields({ name: '📊 Avg Rank', value: avgRank, inline: true })
+        .setDescription(`**${name}**${titleChamp} (${sideLabel})\n\n⏰ Betting closes in **5 minutes** — place your bets!\n🟢 WIN pays **${config.payoutMultiplier}x** · 🔴 LOSE pays **${config.losePayoutMultiplier}x**`)
+        .addFields(
+          { name: '📊 Avg Rank', value: avgRank, inline: true },
+          { name: `🔵 ${name}'s Team`, value: formatTeam(allies) || 'Unknown', inline: false },
+          { name: '🔴 Enemy Team', value: formatTeam(enemies) || 'Unknown', inline: false },
+        )
         .setColor(0x2ecc71)
         .setTimestamp();
 
       if (parleyField) {
-        embed.addFields({ name: '🎲 PARLEY', value: `Over/Under **${parleyField.line}** ${parleyField.label}`, inline: true });
+        if (parleyField.type === 'yesno') {
+          embed.addFields({ name: '🎲 PARLEY', value: `Will **${name}** get **${parleyField.label}**?`, inline: true });
+        } else {
+          embed.addFields({ name: '🎲 PARLEY', value: `Over/Under **${parleyField.line}** ${parleyField.label}`, inline: true });
+        }
       }
 
       const row = new ActionRowBuilder().addComponents(
@@ -189,16 +223,30 @@ async function checkForNewMatches() {
 
       const components = [row];
       if (parleyField) {
-        const parleyRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`parley_over_${matchId}`)
-            .setLabel(`⬆️ OVER ${parleyField.line}`)
-            .setStyle(ButtonStyle.Primary),
-          new ButtonBuilder()
-            .setCustomId(`parley_under_${matchId}`)
-            .setLabel(`⬇️ UNDER ${parleyField.line}`)
-            .setStyle(ButtonStyle.Secondary),
-        );
+        let parleyRow;
+        if (parleyField.type === 'yesno') {
+          parleyRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`parley_over_${matchId}`)
+              .setLabel('✅ YES')
+              .setStyle(ButtonStyle.Success),
+            new ButtonBuilder()
+              .setCustomId(`parley_under_${matchId}`)
+              .setLabel('❌ NO')
+              .setStyle(ButtonStyle.Danger),
+          );
+        } else {
+          parleyRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`parley_over_${matchId}`)
+              .setLabel(`⬆️ OVER ${parleyField.line}`)
+              .setStyle(ButtonStyle.Primary),
+            new ButtonBuilder()
+              .setCustomId(`parley_under_${matchId}`)
+              .setLabel(`⬇️ UNDER ${parleyField.line}`)
+              .setStyle(ButtonStyle.Secondary),
+          );
+        }
         components.push(parleyRow);
       }
 
@@ -228,7 +276,7 @@ async function checkForNewMatches() {
         });
       }
 
-      // Disable buttons after 3 minutes
+      // Close betting after window expires
       setTimeout(() => {
         closeBetting(player.guild_id, matchId, name);
       }, config.bettingWindowMs);
@@ -327,18 +375,37 @@ async function checkActiveMatches() {
     const parley = getMatchParley(match.guild_id, match.match_id);
     const parleyLines = [];
     if (parley?.parley_stat) {
+      const stat = parley.parley_stat;
       let actualValue;
-      if (parley.parley_stat === 'kda') {
+      if (stat === 'kda') {
         actualValue = (participant.kills + participant.assists) / Math.max(participant.deaths, 1);
         actualValue = Math.round(actualValue * 100) / 100;
+      } else if (stat === 'cs') {
+        actualValue = (participant.totalMinionsKilled || 0) + (participant.neutralMinionsKilled || 0);
+      } else if (stat === 'visionScore') {
+        actualValue = participant.visionScore || 0;
+      } else if (stat === 'gameLength') {
+        actualValue = Math.round(result.info.gameDuration / 60 * 10) / 10;
+      } else if (stat === 'firstBlood') {
+        actualValue = participant.firstBloodKill ? 1 : 0;
+      } else if (stat === 'tripleKill') {
+        actualValue = (participant.tripleKills || 0) > 0 ? 1 : 0;
       } else {
-        actualValue = participant[parley.parley_stat];
+        actualValue = participant[stat]; // kills, deaths
       }
 
+      const isYesNo = YES_NO_STATS.has(stat);
       const overWins = actualValue > parley.parley_line;
-      const statLabel = parley.parley_stat === 'kda' ? 'KDA' : parley.parley_stat.charAt(0).toUpperCase() + parley.parley_stat.slice(1);
-      const winSide = overWins ? 'OVER' : 'UNDER';
-      parleyLines.push(`🎲 **Parley:** ${actualValue} ${statLabel} (Line: ${parley.parley_line}) — **${winSide}** wins!`);
+      const statLabel = PARLEY_LABELS[stat] || stat;
+
+      if (isYesNo) {
+        const happened = actualValue > 0.5;
+        const winSide = happened ? 'YES' : 'NO';
+        parleyLines.push(`🎲 **Parley:** ${statLabel} — **${winSide}!**`);
+      } else {
+        const winSide = overWins ? 'OVER' : 'UNDER';
+        parleyLines.push(`🎲 **Parley:** ${actualValue} ${statLabel} (Line: ${parley.parley_line}) — **${winSide}** wins!`);
+      }
 
       const parleyBets = getUnresolvedParleyBetsByMatch(match.guild_id, match.match_id);
       for (const pb of parleyBets) {
@@ -349,20 +416,35 @@ async function checkActiveMatches() {
         resolveParleyBet(pb.id, outcome);
         updateUserStats(match.guild_id, pb.discord_id, correct, payout);
 
-        const emoji = correct ? '✅' : '❌';
+        const pbEmoji = correct ? '✅' : '❌';
         const resultText = correct ? `won **${payout.toLocaleString()}** 🪙` : 'lost their bet';
-        parleyLines.push(`${emoji} <@${pb.discord_id}> bet **${pb.prediction.toUpperCase()}** (${pb.amount.toLocaleString()} 🪙) — ${resultText}`);
+        const displayPred = isYesNo
+          ? (pb.prediction === 'over' ? 'YES' : 'NO')
+          : pb.prediction.toUpperCase();
+        parleyLines.push(`${pbEmoji} <@${pb.discord_id}> bet **${displayPred}** (${pb.amount.toLocaleString()} 🪙) — ${resultText}`);
       }
     }
 
+    // Build tracked player's post-game stat line
+    const k = participant.kills, d = participant.deaths, a = participant.assists;
+    const kda = d === 0 ? 'Perfect' : ((k + a) / d).toFixed(1);
+    const cs = (participant.totalMinionsKilled || 0) + (participant.neutralMinionsKilled || 0);
+    const dmg = (participant.totalDamageDealtToChampions || 0).toLocaleString();
+    const champName = getChampionName(participant.championId);
+    const statLine = `**${champName}** — ${k}/${d}/${a} (${kda} KDA) · ${cs} CS · ${dmg} DMG`;
+
     const outcomeEmoji = trackedPlayerWon ? '🏆' : '💀';
     const outcomeText = trackedPlayerWon ? 'WON' : 'LOST';
+
+    const gameMins = Math.floor(result.info.gameDuration / 60);
+    const gameSecs = result.info.gameDuration % 60;
+    const durationStr = `${gameMins}:${String(gameSecs).padStart(2, '0')}`;
 
     const total = daily.wins + daily.losses;
     const winRate = total > 0 ? daily.wins / total : 0;
     const dailySuffix = winRate > 0.5 ? ` (Today: ${daily.wins}W / ${daily.losses}L 🔥)` : '';
 
-    let description = `**${playerName}** has **${outcomeText}** the match!${dailySuffix}\n\n` +
+    let description = `**${playerName}** has **${outcomeText}** the match! (${durationStr})${dailySuffix}\n${statLine}\n\n` +
       (lines.length > 0 ? lines.join('\n') : '_No bets were placed on this match._');
     if (parleyLines.length > 0) {
       description += '\n\n' + parleyLines.join('\n');

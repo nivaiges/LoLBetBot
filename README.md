@@ -18,6 +18,8 @@ A Discord bot for betting on friends' League of Legends games using the Riot API
 - `/bethere` — Set the current channel for betting notifications
 - `/help` — List all commands
 - **Auto-detect matches** — Polls Riot Spectator API and posts WIN/LOSE buttons when a tracked player enters a game
+- **Team compositions** — Match detection shows both teams' champions and which side (Blue/Red) the tracked player is on
+- **Post-game stats** — Match results show the tracked player's KDA, CS, damage, and game duration
 - **Average lobby rank** — Shows the average Solo/Duo rank of players in the detected match
 - **Custom rank icons** — Configurable Discord emoji for each rank tier
 - **5-minute betting window** — Bets close 5 minutes after match detection
@@ -29,7 +31,7 @@ A Discord bot for betting on friends' League of Legends games using the Riot API
 - **Daily win streak** — Match results show the player's daily W/L when they're winning (>50%)
 - **Peak rank tracking** — Highest rank is recorded after each win
 - **Auto-cleanup** — Match detected and betting closed messages are deleted when the match ends
-- **Parley bets** — 10% of matches get an over/under stat bet (kills/deaths/KDA) with 2x payout
+- **Parley bets** — ~17.5% of matches get a prop bet (over/under or yes/no) with 2x payout. Stats: kills, deaths, KDA, CS, vision score, game length, first blood, triple kill
 - **PUUID auto-refresh** — PUUIDs are re-fetched on startup when rotating Riot API keys
 
 ## Self-Hosting Guide
@@ -197,7 +199,7 @@ Adjustable values in `config.js`:
 | `bettingWindowMs` | 300,000ms | Time to place bets after match detection |
 | `payoutMultiplier` | 1.5 | Payout multiplier for correct WIN bets |
 | `losePayoutMultiplier` | 3 | Payout multiplier for correct LOSE bets |
-| `parleyChance` | 0.1 | Chance of parley bet per match (10%) |
+| `parleyChance` | 0.175 | Chance of parley bet per match (17.5%) |
 | `parleyPayoutMultiplier` | 2 | Payout multiplier for correct parley bets |
 | `commandCooldownMs` | 5,000ms | Per-user rate limit between commands |
 
