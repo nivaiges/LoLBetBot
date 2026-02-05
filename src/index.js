@@ -36,6 +36,7 @@ import * as removeuser from './commands/removeuser.js';
 import * as give from './commands/give.js';
 import * as emoji from './commands/emoji.js';
 import * as history from './commands/history.js';
+import * as achievements from './commands/achievements.js';
 import * as help from './commands/help.js';
 
 // ── Validate env ─────────────────────────────────────────────────────────────
@@ -54,7 +55,7 @@ if (!RIOT_API_KEY) {
 
 // ── Build command collection ─────────────────────────────────────────────────
 
-const commands = [collect, adduser, removeuser, bet, baltop, stats, rank, bethere, peak, autobet, give, emoji, history, help];
+const commands = [collect, adduser, removeuser, bet, baltop, stats, rank, bethere, peak, autobet, give, emoji, history, achievements, help];
 const commandCollection = new Collection();
 for (const cmd of commands) {
   commandCollection.set(cmd.data.name, cmd);

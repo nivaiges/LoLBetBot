@@ -188,7 +188,7 @@ async function checkForNewMatches() {
         const names = team.map(p => p.riotId).filter(Boolean);
         if (!names.length) return null;
         const encoded = names.map(n => encodeURIComponent(n)).join(',');
-        return `https://u.gg/multisearch?summoners=${encoded}&region=${player.region}`;
+        return `https://u.gg/lol/multisearch?summoners=${encoded}&region=${player.region}`;
       };
 
       // Roll for parley (over/under or yes/no stat bet)

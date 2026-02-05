@@ -16,6 +16,7 @@ export async function execute(interaction) {
       '`/baltop` — Coin leaderboard',
       '`/stats` — Your stats, streak, record, and achievements',
       '`/history` — Your last 10 bets with outcomes',
+      '`/achievements` — Achievement progress with progress bars',
       '`/rank` — Tracked players\' current Solo/Duo ranks',
       '`/peak` — Tracked players\' peak Solo/Duo ranks',
       '`/adduser <GameName#TagLine>` — Track a League player',

@@ -13,6 +13,7 @@ A Discord bot for betting on friends' League of Legends games using the Riot API
 - `/baltop` — Leaderboard of top coin holders
 - `/stats` — Your personal betting stats (W/L, streak, net profit, per-player record, achievements)
 - `/history` — Your last 10 bets with outcomes
+- `/achievements` — Achievement progress with progress bars
 - `/rank` — Leaderboard of all tracked players' Solo/Duo ranks
 - `/peak` — All-time peak Solo/Duo rank for each tracked player
 - `/emoji <on|off>` — Toggle rank emojis on/off (for servers without custom emoji)
