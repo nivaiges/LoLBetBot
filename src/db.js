@@ -274,6 +274,12 @@ export function getUserBetOnMatch(guildId, discordId, matchId) {
   `).get(guildId, discordId, matchId);
 }
 
+export function updateBet(betId, prediction, amount) {
+  return db.prepare(`
+    UPDATE bets SET prediction = ?, amount = ? WHERE id = ? AND outcome IS NULL
+  `).run(prediction, amount, betId);
+}
+
 export function getUnresolvedBetsByMatch(guildId, matchId) {
   return db.prepare(`
     SELECT * FROM bets WHERE guild_id = ? AND match_id = ? AND outcome IS NULL

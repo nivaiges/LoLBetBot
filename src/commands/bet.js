@@ -5,7 +5,9 @@ import {
   getActiveMatch,
   getUserBetOnMatch,
   deductCoins,
+  addCoins,
   placeBet,
+  updateBet,
 } from '../db.js';
 import { isBettingOpen } from '../utils/bettingwindow.js';
 
@@ -77,13 +79,29 @@ export async function execute(interaction) {
     return interaction.reply({ content: `Insufficient coins. You have **${user.coins.toLocaleString()}** coins.`, ephemeral: true });
   }
 
-  // Check duplicate bet
+  // Check existing bet — allow updating during betting window
   const existingBet = getUserBetOnMatch(guildId, userId, match.match_id);
   if (existingBet) {
-    return interaction.reply({ content: `You already bet on this match (${existingBet.prediction} for ${existingBet.amount} coins).`, ephemeral: true });
+    // Refund old bet, deduct new amount
+    addCoins(guildId, userId, existingBet.amount);
+    const refreshed = ensureUser(guildId, userId);
+    if (refreshed.coins < amount) {
+      // Undo refund if they can't afford the new bet
+      deductCoins(guildId, userId, existingBet.amount);
+      return interaction.reply({ content: `Insufficient coins. You have **${(refreshed.coins - existingBet.amount).toLocaleString()}** coins (plus ${existingBet.amount.toLocaleString()} in your current bet).`, ephemeral: true });
+    }
+    deductCoins(guildId, userId, amount);
+    updateBet(existingBet.id, prediction, amount);
+
+    const changed = existingBet.prediction !== prediction
+      ? ` (changed from ${existingBet.prediction.toUpperCase()})`
+      : '';
+    return interaction.reply(
+      `Bet updated: **${prediction.toUpperCase()}** on **${target.riot_tag}** for **${amount.toLocaleString()}** coins${changed}. (was ${existingBet.amount.toLocaleString()} coins)`
+    );
   }
 
-  // Place bet
+  // Place new bet
   deductCoins(guildId, userId, amount);
   placeBet(guildId, userId, match.match_id, target.puuid, prediction, amount);
 

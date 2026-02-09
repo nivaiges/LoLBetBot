@@ -24,6 +24,7 @@ import {
   getDailyRecord,
   updatePeakRank,
   getAutoBetsForMatch,
+  removeAutoBet,
   ensureUser,
   getUser,
   getUserBetOnMatch,
@@ -324,6 +325,12 @@ async function checkActiveMatches() {
     logger.info({ matchId: match.match_id, guildId: match.guild_id }, 'Match ended, settling bets');
     markMatchFinished(match.guild_id, match.match_id);
 
+    // Remove auto-bets for this player now that the match is over
+    const autoBetsToRemove = getAutoBetsForMatch(match.guild_id, match.puuid);
+    for (const ab of autoBetsToRemove) {
+      removeAutoBet(match.guild_id, ab.discord_id, match.puuid);
+    }
+
     // Delete match detected and betting closed messages
     const msgs = getMatchMessages(match.guild_id, match.match_id);
     if (msgs) {
@@ -478,13 +485,16 @@ async function checkActiveMatches() {
       description += '\n\n' + achLines.join('\n');
     }
 
-    const embed = new EmbedBuilder()
-      .setTitle(`${outcomeEmoji} Match Over!`)
-      .setDescription(description)
-      .setColor(trackedPlayerWon ? 0x2ecc71 : 0xe74c3c)
-      .setTimestamp();
+    // Only send Match Over notification if there were bets or achievements
+    if (bets.length > 0 || parleyLines.length > 0 || achLines.length > 0) {
+      const embed = new EmbedBuilder()
+        .setTitle(`${outcomeEmoji} Match Over!`)
+        .setDescription(description)
+        .setColor(trackedPlayerWon ? 0x2ecc71 : 0xe74c3c)
+        .setTimestamp();
 
-    sendToGuild(match.guild_id, { embeds: [embed] });
+      sendToGuild(match.guild_id, { embeds: [embed] });
+    }
   }
 }
 
