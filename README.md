@@ -1,77 +1,124 @@
-# discordBetBot
+# LoLBetBot
 
-A Discord bot for betting on friends' League of Legends games using the Riot API. Built with Node.js 20, discord.js v14, and SQLite.
+A Discord bot for betting on friends' League of Legends games using the Riot API. Built with Node.js 20, discord.js v14, SQLite, and `@napi-rs/canvas` for local chart rendering.
 
-## Features
+## Slash Commands
 
-- `/collect` — Collect 10,000 coins (2h rolling cooldown)
-- `/adduser <GameName#TagLine>` — Track a League player for betting
-- `/removeuser <GameName#TagLine>` — Stop tracking a player (also removes their auto-bets)
-- `/bet <win|lose> <amount> [player]` — Bet on a tracked player's match (also available via buttons)
-- `/autobet [player] [prediction] [amount]` — Auto-bet on a player every game
-- `/give <@user> <amount>` — Give coins to another user
-- `/baltop` — Leaderboard of top coin holders
-- `/stats` — Your personal betting stats (W/L, streak, net profit, per-player record, achievements)
-- `/history` — Your last 10 bets with outcomes
-- `/achievements` — Achievement progress with progress bars
-- `/rank` — Leaderboard of all tracked players' Solo/Duo ranks
-- `/peak` — All-time peak Solo/Duo rank for each tracked player
-- `/emoji <on|off>` — Toggle rank emojis on/off (for servers without custom emoji)
+### Currency & Stats
+- `/collect` — Collect 10,000 coins (2 h rolling cooldown)
+- `/give <@user> <amount>` — Transfer coins to another user
+- `/baltop` — Coin-balance leaderboard
+- `/stats` — Personal betting stats (W/L, streak, net profit, per-player record, achievements) plus a **cumulative profit chart** from your full bet history
+- `/history` — Last 10 bets with outcomes and payouts
+- `/achievements` — Achievement progress bars
+
+### Tracked Players
+- `/adduser <GameName#TagLine>` — Add a tracked player
+- `/removeuser <GameName#TagLine>` — Stop tracking
+- `/rank` — Current Solo/Duo ranks of all tracked players + record + peak-recovery distance
+- `/peak` — All-time peak Solo/Duo rank per tracked player
+- `/records [season]` — Historical peak ranks from past seasons (populated by `season-reset.js`)
+- `/lp [player]` — **LP history graph** with tier bands, division markers, and win/loss point colors
+- `/duo` — Duo W/L records (auto-tracked when two tracked players are on the same team)
+
+### Betting
+- `/bet <win|lose> <amount> [player]` — Bet on a tracked player's match (also available via buttons on match-detected embeds)
+- `/autobet [player] [prediction] [amount]` — Auto-bet on a player every game; persistent until cleared
+
+### Admin / Settings
 - `/bethere` — Set the current channel for betting notifications
+- `/emoji <on|off>` — Toggle rank emoji display
 - `/help` — List all commands
-- **Auto-detect matches** — Polls Riot Spectator API and posts WIN/LOSE buttons when a tracked player enters a game
-- **Team compositions** — Match detection shows both teams' champions and which side (Blue/Red) the tracked player is on
-- **Post-game stats** — Match results show the tracked player's KDA, CS, damage, and game duration
-- **Average lobby rank** — Shows the average Solo/Duo rank of players in the detected match
-- **Custom rank icons** — Configurable Discord emoji for each rank tier
-- **5-minute betting window** — Bets close 5 minutes after match detection
-- **Asymmetric payouts** — WIN bets pay 1.5x, LOSE bets pay 3x (higher risk, higher reward)
-- **Auto-settle bets** — When a match ends, payouts are calculated and results are announced
-- **Betting streaks** — Consecutive correct bets build a streak shown in results and `/stats`
-- **Coin gifting** — Transfer coins to other users with `/give`
-- **Auto-bet** — Users can set recurring bets that fire automatically on match detection
-- **Daily win streak** — Match results show the player's daily W/L when they're winning (>50%)
-- **Peak rank tracking** — Highest rank is recorded after each win
-- **Auto-cleanup** — Match detected and betting closed messages are deleted when the match ends
-- **Parley bets** — ~17.5% of matches get a prop bet (over/under or yes/no) with 2x payout. Stats: kills, deaths, KDA, CS, vision score, game length, first blood, triple kill
-- **Achievements** — Milestone unlocks for bets placed (10/50/100/500/1k), bets won (10/50/100/1k), and win streaks (5/10/20/50/100), announced in match results and shown in `/stats`
-- **Bet history** — `/history` shows your last 10 bets with outcomes and payouts
-- **Net profit** — `/stats` shows total profit/loss (total won minus total wagered)
-- **Per-player record** — `/stats` shows your W/L and amount wagered per tracked player
-- **PUUID auto-refresh** — PUUIDs are re-fetched on startup when rotating Riot API keys
 
-## Self-Hosting Guide
+## What the Bot Does Automatically
 
-Anyone can run their own instance of this bot. You'll need your own Discord bot token and Riot API key (both are free).
+- **Match detection** — Polls Riot Spectator-V5 every 60 s for tracked players. When one enters a ranked game it posts a Match Detected embed with both team comps, the average lobby rank, and three buttons: 🟢 WIN, 🔴 LOSE, and 🟡 **Auto-bet** (sets up a recurring bet on this player via a modal)
+- **Parlay generation** — ~17.5 % of matches roll a 2- to 4-leg prop bet (over/under or yes/no). Stats: kills, deaths, KDA, CS, vision score, game length, first blood, triple kill, **won lane**. Payout = 2ⁿ for an n-leg parlay
+- **Auto-bets fire on next match** — Persistent across games until explicitly cleared with `/autobet … clear:True`
+- **5-minute betting window** — Bets close 5 min after match detection; the embed gets edited to "BETTING CLOSED"
+- **Remake handling** — Riot's `gameEndedInEarlySurrender` flag triggers a full bet refund with no W/L recorded
+- **Auto-settle bets** — On match end the bot calls Match-V5, calculates payouts (WIN pays 1.5×, LOSE pays 3×, parlay pays 2ⁿ), updates user stats and achievements
+- **Daily W/L** — Match results show the player's today's record, with 🔥 when above 50 %. Resets at local midnight (not UTC)
+- **Won lane** — At match end, the bot compares gold@14 vs the role opponent and increments `lane_wins` / `lane_losses` per tracked player. Shown in Match Over as 🛣️ Won Lane / Lost Lane
+- **Peak rank tracking** — Updates after every match; `/rank` shows distance from peak
 
-### Step 1: Get a Discord Bot Token
+### Match Over Gold Chart
 
-1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)
-2. Click **New Application**, give it a name, and create it
-3. Go to the **Bot** tab and click **Reset Token** — copy and save this token
-4. Under **Privileged Gateway Intents**, you don't need any special intents
-5. Go to **OAuth2 > URL Generator**:
-   - Scopes: `bot`, `applications.commands`
-   - Bot Permissions: `Send Messages`, `Embed Links`, `Read Message History`, `Manage Messages`
-6. Copy the generated URL and open it in your browser to invite the bot to your server
+Every Match Over message comes with a 520×200 PNG chart of the **team gold lead** over time:
 
-### Step 2: Get a Riot API Key
+- **Single line** with blue area-fill where the team was ahead, red where they were behind, switching at the y = 0 crossing
+- **Peak callouts** — pill labels for max lead and max deficit (`+5.4k @ 22m` / `-2.8k @ 8m`)
+- **Objective pins** — real Riot minimap icons (loaded from `assets/objectives/`) for **Baron**, **Rift Herald**, **Void Grubs**, **all six elemental dragons** (Ocean / Mountain / Cloud / Infernal / Hextech / Chemtech), and **Dragon Soul** (the 4th elemental of a team). Pin color = blue if the tracked team got it, red if the enemy. Pin position flips to the bottom of the plot when the line is below zero at that minute, with a dashed guide line spanning the chart
+- **Kill X-stacks** — for every kill the tracked player gets, an X anchored at the y = 0 baseline. Multikills within 10 s collapse into one column that stacks `XX` / `XXX` / `XXXX` / `XXXXX` vertically, with colors escalating yellow → orange → red → purple → hot pink for single → penta. The stack direction flips down when the player is behind at that moment
+- **💾 Save** and **📌 Keep in Chat** buttons — see *Save / Keep* below
 
-1. Go to [developer.riotgames.com](https://developer.riotgames.com/) and sign in with your Riot account
-2. Your **Development API Key** is shown on the dashboard — copy it
+### LP Graph (`/lp`)
 
-> **Note:** Development keys expire every 24 hours and need to be regenerated. For a permanent key, you can [register a production app](https://developer.riotgames.com/app-type), but the development key works fine for personal use.
+Per-player LP history rendered locally. Captures a snapshot on every match-end peak check and on every `/rank` call (skips duplicates when LP/tier hasn't changed). Renders:
 
-### Step 3: Install and Run
+- Single line plotting **absolute LP** so promotions across divisions read as a continuous climb
+- **Tier bands** drawn as faint colored zones with labels (Iron through Master+); always extends the visible range to include at least half of the tier band below the player, so a Master player can see how far above Diamond they are
+- **Tier boundary lines** — dashed horizontal markers at each promotion threshold
+- **Per-point W/L colors** — green when LP rose from the previous entry, red when it fell, blue for the first point
+- Peak callout with the tier+rank+LP at the high point, "now: …" callout at the current point
+
+### Profit Chart (`/stats`)
+
+Cumulative net profit over your full bet history, signed-line chart with the same blue/red fill split at zero. Pulls from `bets` and `parley_bets` (cancelled bets ignored).
+
+## Save / Keep (allowlisted)
+
+Two buttons appear under every Match Over chart:
+
+- **💾 Save** — writes the PNG to `saved-graphs/<user-id>/<match-id>.png` on the bot host
+- **📌 Keep in Chat** — re-posts the chart as a standalone chat message captioned `📌 Kept by <user>`. The re-posted message isn't tracked, so it survives the auto-clear when the next match starts. Gets removed at the next nightly cleanup
+
+Both buttons are gated by `config.saveGraphAllowedUserIds` — only the listed Discord user IDs can click them; everyone else gets an ephemeral "not allowed" reply.
+
+## Message Lifecycle & Cleanup
+
+- The bot edits the Match Detected embed to "BETTING CLOSED" when the window expires
+- It deletes the match-detected, betting-closed, and any auto-bet notification messages when the match ends
+- It deletes the previous Match Over embed when the same player enters their next game
+- **Nightly cleanup** — at 12:01 AM local time the bot deletes its own messages from the past 3 days in the configured channel, skipping anything tied to an in-progress match
+- **Manual cleanup** — `node cleanup-recent.js [--dry-run] [days=3]` runs the same logic on demand
+
+## Season Reset
+
+When a new ranked season starts:
 
 ```bash
-git clone https://github.com/nivaiges/discordBetBot.git
-cd discordBetBot
+node season-reset.js "2026 Season 1"
+```
+
+Snapshots every tracked player's current `peak_tier / peak_rank / peak_lp` into `peak_records` tagged with that season label, then clears tracked-player peaks, daily W/L, user betting stats, duo pair W/L, and lane W/L. Coin balances and bet history are preserved. `/records season:2026 Season 1` then displays the frozen snapshot.
+
+## Self-Hosting
+
+You need your own Discord bot token and Riot API key (both free).
+
+### Discord Bot Token
+
+1. [Discord Developer Portal](https://discord.com/developers/applications) → **New Application** → **Bot** tab → **Reset Token** → copy
+2. OAuth2 → URL Generator → scopes `bot` + `applications.commands`, permissions `Send Messages`, `Embed Links`, `Read Message History`, `Manage Messages` (Manage Messages is required for the nightly bulk cleanup)
+3. Open the generated URL to invite the bot
+
+### Riot API Key
+
+[developer.riotgames.com](https://developer.riotgames.com/) → sign in → copy the **Development API Key** shown on the dashboard.
+
+> Development keys expire every 24 h and need regenerating. For longer-lived keys, register a production app.
+
+### Install and Run
+
+```bash
+git clone https://github.com/nivaiges/LoLBetBot.git
+cd LoLBetBot
 npm install
 cp .env.example .env
 ```
 
-Edit `.env` with your keys:
+Edit `.env`:
 
 ```
 DISCORD_TOKEN=your_discord_bot_token
@@ -80,7 +127,7 @@ RIOT_REGION=na1
 LOG_LEVEL=info
 ```
 
-Set `RIOT_REGION` to your server's platform code:
+Region codes:
 
 | Region | Code |
 |---|---|
@@ -96,122 +143,86 @@ Set `RIOT_REGION` to your server's platform code:
 | Turkey | `tr1` |
 | Russia | `ru` |
 
-Then start the bot:
+Start the bot:
 
 ```bash
-npm start
+npm start          # production
+npm run start:watch # dev with file-change auto-restart
 ```
 
-For development with auto-restart on file changes:
+### First-Time Setup in Discord
+
+1. `/bethere` in the channel you want notifications in
+2. `/adduser YourName#TAG` for each tracked player
+3. When a tracked player queues into a ranked game, the bot posts betting buttons
+
+## Updating
 
 ```bash
-npm run start:watch
+cd LoLBetBot
+git pull
+npm install
 ```
 
-### Step 4: First-Time Setup in Discord
+Then restart the bot. New schema columns and tables auto-migrate on startup — no data loss.
 
-1. Use `/bethere` in the channel where you want betting notifications
-2. Use `/adduser YourName#TAG` to start tracking a player
-3. When the tracked player enters a ranked game, the bot will automatically post betting buttons
-
-## Updating the Bot
-
-If you downloaded the bot as a ZIP or copied the files manually (no `.git` folder), you'll need to set up git tracking first before you can pull updates.
-
-### If you don't have a `.git` folder
+On Raspberry Pi:
 
 ```bash
-cd discordBetBot
+sudo systemctl restart discord-bet-bot
+```
+
+If you cloned without `.git`:
+
+```bash
+cd LoLBetBot
 git init
-git remote add origin https://github.com/nivaiges/discordBetBot.git
+git remote add origin https://github.com/nivaiges/LoLBetBot.git
 git fetch origin
 git reset origin/main
 git checkout -- .
 npm install
 ```
 
-This connects your local copy to the repo without overwriting your `.env` or `bot.db` — your config and database are preserved.
+Your `.env`, `bot.db`, and `saved-graphs/` are preserved.
 
-### If you already have `.git` set up
-
-```bash
-cd discordBetBot
-git pull
-npm install
-```
-
-Then restart the bot. New database columns are added automatically on startup — no data is lost.
-
-### On Raspberry Pi (systemd)
+## Raspberry Pi
 
 ```bash
-cd discordBetBot
-git pull
-npm install
-sudo systemctl restart discord-bet-bot
-```
-
-## Raspberry Pi Deployment
-
-### Quick Setup
-
-```bash
-git clone https://github.com/nivaiges/discordBetBot.git
-cd discordBetBot
+git clone https://github.com/nivaiges/LoLBetBot.git
+cd LoLBetBot
 chmod +x setup-pi.sh
 ./setup-pi.sh
 ```
 
-This single script installs Node.js 20, build tools, npm dependencies, creates `.env` from template, and sets up a systemd service with auto-restart on crash and reboot.
-
-After the script runs, edit your `.env` with your keys, then:
+Installs Node 20, build tools, npm deps, scaffolds `.env`, and registers a systemd service with crash-restart. Edit `.env` then:
 
 ```bash
 sudo systemctl restart discord-bet-bot
+sudo systemctl status discord-bet-bot
+sudo journalctl -u discord-bet-bot -f   # live logs
 ```
-
-### Manual Setup
-
-1. Clone to your Pi
-2. Run `npm install` (requires `build-essential` for native SQLite compilation)
-3. Copy and fill in `.env`
-4. Install the systemd service:
-
-```bash
-sudo cp discord-bet-bot.service /etc/systemd/system/
-sudo systemctl enable --now discord-bet-bot
-```
-
-### Useful Commands
-
-```bash
-sudo systemctl status discord-bet-bot     # Check status
-sudo journalctl -u discord-bet-bot -f     # View logs
-sudo systemctl restart discord-bet-bot    # Restart
-sudo systemctl stop discord-bet-bot       # Stop
-```
-
-The bot will auto-restart on crash (10s delay) or reboot.
 
 ## Configuration
 
-Adjustable values in `config.js`:
+`config.js`:
 
 | Setting | Default | Description |
 |---|---|---|
-| `collectAmount` | 10,000 | Coins per collect |
-| `collectCooldownMs` | 2 hours | Time between collects |
-| `pollIntervalMs` | 60,000ms | How often to check for active games |
-| `bettingWindowMs` | 300,000ms | Time to place bets after match detection |
-| `payoutMultiplier` | 1.5 | Payout multiplier for correct WIN bets |
-| `losePayoutMultiplier` | 3 | Payout multiplier for correct LOSE bets |
-| `parleyChance` | 0.175 | Chance of parley bet per match (17.5%) |
-| `parleyPayoutMultiplier` | 2 | Payout multiplier for correct parley bets |
-| `commandCooldownMs` | 5,000ms | Per-user rate limit between commands |
+| `collectAmount` | 10,000 | Coins per `/collect` |
+| `collectCooldownMs` | 7,200,000 (2 h) | Time between collects |
+| `pollIntervalMs` | 60,000 (1 min) | How often to check Spectator-V5 |
+| `bettingWindowMs` | 300,000 (5 min) | Bet window after match detection |
+| `payoutMultiplier` | 1.5 | WIN bet payout |
+| `losePayoutMultiplier` | 3 | LOSE bet payout |
+| `parleyChance` | 0.175 | Probability of a parlay per match |
+| `parleyPayoutMultiplier` | 2 | Per-leg multiplier (total = 2ⁿ for n legs) |
+| `commandCooldownMs` | 5,000 | Per-user rate limit |
+| `saveGraphAllowedUserIds` | `Set([...])` | Discord user IDs allowed to use 💾 Save / 📌 Keep buttons |
 
 ### Custom Rank Emoji
 
-To show rank icons in bot messages, upload rank images as custom emoji in your Discord server, then fill in the IDs in `config.js`:
+Upload rank icons as custom emoji in your Discord server, then fill in `config.js`:
 
 ```js
 rankEmoji: {
@@ -221,15 +232,29 @@ rankEmoji: {
 },
 ```
 
-To get an emoji ID: type `\:emojiname:` in Discord and send — it shows `<:name:ID>`.
+Get an emoji ID by typing `\:emojiname:` in Discord and sending the message.
+
+### Objective Icons
+
+`assets/objectives/*.png` ships with this repo — minimap icons for Baron, Rift Herald, Void Grubs, all six elemental dragons, and the Elder Dragon (used as the Soul marker). Sourced from Community Dragon. Drop your own PNGs at the same paths to override.
+
+## Files Excluded From the Repo
+
+`.gitignore` keeps the following out:
+- `node_modules/`, `.env`
+- `*.db`, `*.db-shm`, `*.db-wal` — SQLite + WAL files
+- `logs/` — runtime log output
+- `sounds/` — voice-channel join sound files (named after Discord user IDs, personal)
+- `saved-graphs/` — user-saved Match Over PNGs
+- `.claude/` — Claude Code local state
 
 ## Riot API Notes
 
-The bot uses two types of Riot API endpoints:
+The bot uses two endpoint groups:
 
-| Endpoint Type | Example Host | Used For |
+| Type | Example host | Used for |
 |---|---|---|
-| Platform (region) | `na1.api.riotgames.com` | Spectator, League |
-| Regional (continent) | `americas.api.riotgames.com` | Account, Match history |
+| Platform (region) | `na1.api.riotgames.com` | Spectator-V5, League-V4 |
+| Regional (continent) | `americas.api.riotgames.com` | Account-V1, Match-V5, Match-V5 Timeline |
 
-The bot automatically maps your `RIOT_REGION` to the correct regional endpoint. If you rotate your Riot API key, just update `.env` and restart — PUUIDs are refreshed automatically on startup.
+The platform code from `RIOT_REGION` auto-maps to the correct regional endpoint. If you rotate your API key, just update `.env` and restart — PUUIDs are re-fetched on startup so the bot keeps working with the new key.
