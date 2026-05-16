@@ -216,12 +216,15 @@ client.on('interactionCreate', async (interaction) => {
       if (!config.saveGraphAllowedUserIds.has(interaction.user.id)) {
         return interaction.reply({ content: '❌ You\'re not allowed to do that.', ephemeral: true });
       }
-      const attachment = interaction.message?.attachments?.first();
-      if (!attachment?.url) {
-        return interaction.reply({ content: '❌ No graph attachment on this message.', ephemeral: true });
+      // Embeds with setImage('attachment://...') consume the attachment into
+      // the embed image, so message.attachments is often empty. Try both.
+      const url = interaction.message?.attachments?.first()?.url
+                || interaction.message?.embeds?.[0]?.image?.url;
+      if (!url) {
+        return interaction.reply({ content: '❌ No graph found on this message.', ephemeral: true });
       }
       try {
-        const res = await fetch(attachment.url);
+        const res = await fetch(url);
         if (!res.ok) {
           return interaction.reply({ content: `❌ Failed to fetch graph (HTTP ${res.status}).`, ephemeral: true });
         }
@@ -250,12 +253,13 @@ client.on('interactionCreate', async (interaction) => {
       if (!config.saveGraphAllowedUserIds.has(interaction.user.id)) {
         return interaction.reply({ content: '❌ You\'re not allowed to save graphs.', ephemeral: true });
       }
-      const attachment = interaction.message?.attachments?.first();
-      if (!attachment?.url) {
-        return interaction.reply({ content: '❌ No graph attachment on this message.', ephemeral: true });
+      const url = interaction.message?.attachments?.first()?.url
+                || interaction.message?.embeds?.[0]?.image?.url;
+      if (!url) {
+        return interaction.reply({ content: '❌ No graph found on this message.', ephemeral: true });
       }
       try {
-        const res = await fetch(attachment.url);
+        const res = await fetch(url);
         if (!res.ok) {
           return interaction.reply({ content: `❌ Failed to fetch graph (HTTP ${res.status}).`, ephemeral: true });
         }
