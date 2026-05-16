@@ -1,6 +1,7 @@
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 import { getPeakRanks, isEmojiEnabled } from '../db.js';
 import config from '../../config.js';
+import { displayTag } from '../utils/displayName.js';
 
 const TIER_ORDER = [
   'CHALLENGER', 'GRANDMASTER', 'MASTER',
@@ -28,9 +29,9 @@ export async function execute(interaction) {
   }
 
   const results = players.map(p => {
-    if (!p.peak_tier) return { tag: p.riot_tag, rank: null };
+    if (!p.peak_tier) return { tag: displayTag(p.riot_tag), rank: null };
     return {
-      tag: p.riot_tag,
+      tag: displayTag(p.riot_tag),
       tier: p.peak_tier,
       rank: `${p.peak_tier} ${p.peak_rank}`,
       lp: p.peak_lp,

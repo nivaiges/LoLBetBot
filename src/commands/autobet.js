@@ -1,5 +1,6 @@
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 import { getTrackedPlayerByTag, ensureUser, setAutoBet, removeAutoBet, getAutoBets } from '../db.js';
+import { displayTag } from '../utils/displayName.js';
 
 export const data = new SlashCommandBuilder()
   .setName('autobet')
@@ -30,7 +31,7 @@ export async function execute(interaction) {
     }
     const lines = autoBets.map(ab => {
       const emoji = ab.prediction === 'win' ? '🟢' : '🔴';
-      return `${emoji} **${ab.riot_tag}** — ${ab.prediction.toUpperCase()} for **${ab.amount.toLocaleString()}** 🪙`;
+      return `${emoji} **${displayTag(ab.riot_tag)}** — ${ab.prediction.toUpperCase()} for **${ab.amount.toLocaleString()}** 🪙`;
     });
     const embed = new EmbedBuilder()
       .setTitle('🤖 Your Auto-Bets')
@@ -48,7 +49,7 @@ export async function execute(interaction) {
   // Clear mode
   if (clear) {
     removeAutoBet(guildId, userId, tracked.puuid);
-    return interaction.reply({ content: `✅ Auto-bet removed for **${playerTag}**.`, ephemeral: true });
+    return interaction.reply({ content: `✅ Auto-bet removed for **${displayTag(tracked.riot_tag)}**.`, ephemeral: true });
   }
 
   // Set mode — require prediction and amount

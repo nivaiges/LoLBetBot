@@ -88,6 +88,17 @@ const config = {
   getRankEmoji(tier) {
     return this.rankEmoji[tier] || '';
   },
+
+  // Join sounds are auto-loaded from the sounds/ folder.
+  // Name the file after the Discord user ID (e.g. 189916265060499456.mp3).
+
+  // Discord user IDs allowed to click the "Save Graph" button on Match Over
+  // embeds. Saves PNG to saved-graphs/<userId>/<matchId>.png on the bot host.
+  saveGraphAllowedUserIds: new Set([
+    '189916265060499456',
+    '189717256438022145',
+    '188477218739978252',
+  ]),
 };
 
 export default config;

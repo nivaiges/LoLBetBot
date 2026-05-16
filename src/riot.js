@@ -48,6 +48,11 @@ async function riotFetch(url) {
     return { rateLimited: true, retryAfter: parseInt(retryAfter, 10) };
   }
 
+  if (res.status === 403) {
+    logger.warn({ url }, 'Riot API 403 Forbidden (likely custom game)');
+    return { forbidden: true };
+  }
+
   if (res.status === 404) {
     return null; // Not found is a normal response (e.g. player not in game)
   }
@@ -58,6 +63,31 @@ async function riotFetch(url) {
     return null;
   }
 
+  return res.json();
+}
+
+// Like riotFetch but preserves error distinction (404 vs 5xx vs network).
+// Returns one of: parsed JSON | { notFound: true } | { rateLimited, retryAfter } | { forbidden: true } | { httpError: status } | { networkError: message }
+async function riotFetchDetailed(url) {
+  logger.debug({ url }, 'Riot API request (detailed)');
+  let res;
+  try {
+    res = await fetch(url, { headers: { 'X-Riot-Token': RIOT_KEY } });
+  } catch (err) {
+    logger.error({ err: err.message, url }, 'Riot API network error');
+    return { networkError: err.message };
+  }
+  if (res.status === 404) return { notFound: true };
+  if (res.status === 429) {
+    const retryAfter = res.headers.get('Retry-After') || '10';
+    return { rateLimited: true, retryAfter: parseInt(retryAfter, 10) };
+  }
+  if (res.status === 403) return { forbidden: true };
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    logger.error({ status: res.status, url, body }, 'Riot API error');
+    return { httpError: res.status };
+  }
   return res.json();
 }
 
@@ -76,7 +106,7 @@ export async function getAccountByRiotId(gameName, tagLine, platform) {
  */
 export async function getActiveGame(puuid, platform) {
   const base = config.platformUrl(platform || config.riotRegion);
-  return riotFetch(`${base}/lol/spectator/v5/active-games/by-summoner/${puuid}`);
+  return riotFetchDetailed(`${base}/lol/spectator/v5/active-games/by-summoner/${puuid}`);
 }
 
 /**
@@ -86,6 +116,15 @@ export async function getActiveGame(puuid, platform) {
 export async function getMatchResult(matchId, platform) {
   const base = config.regionalUrl(platform || config.riotRegion);
   return riotFetch(`${base}/lol/match/v5/matches/${matchId}`);
+}
+
+/**
+ * Fetch the per-minute timeline for a completed match.
+ * Returns frames with participantFrames containing totalGold/xp/level/etc.
+ */
+export async function getMatchTimeline(matchId, platform) {
+  const base = config.regionalUrl(platform || config.riotRegion);
+  return riotFetch(`${base}/lol/match/v5/matches/${matchId}/timeline`);
 }
 
 /**

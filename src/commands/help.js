@@ -19,8 +19,12 @@ export async function execute(interaction) {
       '`/achievements` — Achievement progress with progress bars',
       '`/rank` — Tracked players\' current Solo/Duo ranks',
       '`/peak` — Tracked players\' peak Solo/Duo ranks',
+      '`/records [season]` — Past seasons\' peak Solo/Duo ranks',
+      '`/lp [player]` — LP history graph for a tracked player',
       '`/adduser <GameName#TagLine>` — Track a League player',
       '`/removeuser <GameName#TagLine>` — Stop tracking a player',
+      '`/duo` — View duo win/loss records (auto-tracked)',
+      '`/duo reset:Player1#TAG,Player2#TAG` — Reset a duo pair record',
       '`/emoji <on|off>` — Toggle rank emojis on/off',
       '`/bethere` — Set the channel for betting notifications',
     ].join('\n'))

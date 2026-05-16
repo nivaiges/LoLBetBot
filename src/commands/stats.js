@@ -1,5 +1,7 @@
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
-import { ensureUser, getPerPlayerRecord, getUnlockedAchievements, ACHIEVEMENT_DEFS } from '../db.js';
+import { ensureUser, getPerPlayerRecord, getUnlockedAchievements, ACHIEVEMENT_DEFS, getProfitHistory } from '../db.js';
+import { displayName } from '../utils/displayName.js';
+import { renderProfitPng } from '../matchGraph.js';
 
 export const data = new SlashCommandBuilder()
   .setName('stats')
@@ -31,7 +33,7 @@ export async function execute(interaction) {
   const records = getPerPlayerRecord(guildId, userId);
   if (records.length > 0) {
     const recordLines = records.map(r => {
-      const name = r.riot_tag ? r.riot_tag.split('#')[0] : 'Unknown';
+      const name = r.riot_tag ? displayName(r.riot_tag) : 'Unknown';
       return `${name}: ${r.wins}W / ${r.losses}L (${r.total_wagered.toLocaleString()} 🪙)`;
     });
     embed.addFields({ name: '🎮 Per-Player Record', value: recordLines.join('\n'), inline: false });
@@ -47,5 +49,22 @@ export async function execute(interaction) {
     }
   }
 
-  return interaction.reply({ embeds: [embed] });
+  // Cumulative profit chart — render only when the user has at least 2
+  // resolved bets (need an arc, not just a point).
+  let chartFile = null;
+  try {
+    const series = getProfitHistory(guildId, userId);
+    if (series && series.length >= 3) {
+      const pngBuf = await renderProfitPng(series);
+      if (pngBuf) {
+        chartFile = { attachment: pngBuf, name: 'profit.png' };
+        embed.setImage('attachment://profit.png');
+      }
+    }
+  } catch {
+    // Falls through silently — stats embed always sends, with or without chart.
+  }
+
+  const payload = chartFile ? { embeds: [embed], files: [chartFile] } : { embeds: [embed] };
+  return interaction.reply(payload);
 }

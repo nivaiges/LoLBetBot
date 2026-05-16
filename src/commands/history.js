@@ -1,6 +1,7 @@
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 import { getBetHistory } from '../db.js';
 import config from '../../config.js';
+import { displayName } from '../utils/displayName.js';
 
 export const data = new SlashCommandBuilder()
   .setName('history')
@@ -14,7 +15,7 @@ export async function execute(interaction) {
   }
 
   const lines = bets.map(b => {
-    const player = b.riot_tag ? b.riot_tag.split('#')[0] : 'Unknown';
+    const player = b.riot_tag ? displayName(b.riot_tag) : 'Unknown';
     const pred = b.prediction.toUpperCase();
     const amount = b.amount.toLocaleString();
 

@@ -1,3 +1,20 @@
+# Dependencies
 node_modules/
+
+# Secrets
 .env
+
+# SQLite (db + WAL files)
 *.db
+*.db-shm
+*.db-wal
+
+# Runtime logs
+logs/
+
+# User-specific runtime assets (not committed)
+sounds/
+saved-graphs/
+
+# Local AI tool state
+.claude/

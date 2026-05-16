@@ -1,26 +1,35 @@
 import 'dotenv/config';
+import { writeFile, mkdir } from 'node:fs/promises';
+import path from 'node:path';
 import {
   Client, GatewayIntentBits, Collection, REST, Routes,
   ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
 } from 'discord.js';
 import logger from './utils/logger.js';
+import { fileLog } from './utils/fileLog.js';
 import { isRateLimited } from './utils/ratelimit.js';
 import { startPoller } from './poller.js';
+import { startCleanupSchedule } from './cleanup.js';
+import { displayTag } from './utils/displayName.js';
 import {
   ensureUser,
   getActiveMatchByMatchId,
+  getActiveMatchByMessageId,
   getUserBetOnMatch,
   deductCoins,
   placeBet,
-  getMatchParley,
+  getMatchParlay,
   getUserParleyBetOnMatch,
   placeParleyBet,
   getAllTrackedPlayers,
   updateTrackedPlayerPuuid,
+  updateCollect,
+  setAutoBet,
 } from './db.js';
 import config from '../config.js';
 import { getAccountByRiotId } from './riot.js';
 import { isBettingOpen } from './utils/bettingwindow.js';
+import { loadSounds, playJoinSound } from './joinSound.js';
 
 // Import commands
 import * as collect from './commands/collect.js';
@@ -31,6 +40,8 @@ import * as stats from './commands/stats.js';
 import * as rank from './commands/rank.js';
 import * as bethere from './commands/bethere.js';
 import * as peak from './commands/peak.js';
+import * as records from './commands/records.js';
+import * as lp from './commands/lp.js';
 import * as autobet from './commands/autobet.js';
 import * as removeuser from './commands/removeuser.js';
 import * as give from './commands/give.js';
@@ -38,6 +49,19 @@ import * as emoji from './commands/emoji.js';
 import * as history from './commands/history.js';
 import * as achievements from './commands/achievements.js';
 import * as help from './commands/help.js';
+import * as duo from './commands/duo.js';
+
+function tryAutoCollect(guildId, userId, user) {
+  const now = new Date();
+  if (user.last_collect_at) {
+    const lastCollect = new Date(user.last_collect_at + 'Z');
+    const elapsed = now.getTime() - lastCollect.getTime();
+    if (elapsed < config.collectCooldownMs) return null;
+  }
+  const newCoins = user.coins + config.collectAmount;
+  updateCollect(guildId, userId, newCoins, now.toISOString().replace('T', ' ').slice(0, 19));
+  return newCoins;
+}
 
 // ── Validate env ─────────────────────────────────────────────────────────────
 
@@ -55,7 +79,7 @@ if (!RIOT_API_KEY) {
 
 // ── Build command collection ─────────────────────────────────────────────────
 
-const commands = [collect, adduser, removeuser, bet, baltop, stats, rank, bethere, peak, autobet, give, emoji, history, achievements, help];
+const commands = [collect, adduser, removeuser, bet, baltop, stats, rank, bethere, peak, records, lp, autobet, give, emoji, history, achievements, help, duo];
 const commandCollection = new Collection();
 for (const cmd of commands) {
   commandCollection.set(cmd.data.name, cmd);
@@ -81,7 +105,7 @@ async function registerCommands(clientId) {
 // ── Create client ────────────────────────────────────────────────────────────
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildVoiceStates],
 });
 
 async function refreshPuuids() {
@@ -102,14 +126,36 @@ async function refreshPuuids() {
   }
 }
 
+loadSounds();
+
+client.on('voiceStateUpdate', (oldState, newState) => {
+  if (!oldState.channelId && newState.channelId) {
+    playJoinSound(newState.member);
+  }
+});
+
 client.once('ready', async () => {
   logger.info({ user: client.user.tag, guilds: client.guilds.cache.size }, 'Bot is online');
   await registerCommands(client.user.id);
   await refreshPuuids();
   startPoller(client);
+  startCleanupSchedule(client);
 });
 
 client.on('interactionCreate', async (interaction) => {
+  // ── Autocomplete ─────────────────────────────────────────────────────────
+  if (interaction.isAutocomplete()) {
+    const cmd = commandCollection.get(interaction.commandName);
+    if (cmd?.autocomplete) {
+      try {
+        await cmd.autocomplete(interaction);
+      } catch (err) {
+        logger.error({ err, command: interaction.commandName }, 'Autocomplete error');
+      }
+    }
+    return;
+  }
+
   // ── Slash commands ───────────────────────────────────────────────────────
   if (interaction.isChatInputCommand()) {
     const cmd = commandCollection.get(interaction.commandName);
@@ -162,32 +208,143 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // Parley over/under buttons
-    if (id.startsWith('parley_over_') || id.startsWith('parley_under_')) {
-      const prediction = id.startsWith('parley_over_') ? 'over' : 'under';
-      const matchId = id.startsWith('parley_over_') ? id.slice('parley_over_'.length) : id.slice('parley_under_'.length);
+    // Keep in Chat button — re-posts the graph as a standalone chat message
+    // (untracked by last_match_over_message_id, so it survives the auto-clear
+    // when the next match starts). Cleared by the nightly 12:01 AM cleanup.
+    if (id.startsWith('keep_gold_')) {
+      const matchId = id.slice('keep_gold_'.length);
+      if (!config.saveGraphAllowedUserIds.has(interaction.user.id)) {
+        return interaction.reply({ content: '❌ You\'re not allowed to do that.', ephemeral: true });
+      }
+      const attachment = interaction.message?.attachments?.first();
+      if (!attachment?.url) {
+        return interaction.reply({ content: '❌ No graph attachment on this message.', ephemeral: true });
+      }
+      try {
+        const res = await fetch(attachment.url);
+        if (!res.ok) {
+          return interaction.reply({ content: `❌ Failed to fetch graph (HTTP ${res.status}).`, ephemeral: true });
+        }
+        const buf = Buffer.from(await res.arrayBuffer());
+        const channel = interaction.channel;
+        if (!channel) {
+          return interaction.reply({ content: '❌ Channel not available.', ephemeral: true });
+        }
+        await channel.send({
+          content: `📌 Kept by **${interaction.user.username}** — match \`${matchId}\``,
+          files: [{ attachment: buf, name: `gold-lead-${matchId}.png` }],
+          allowedMentions: { parse: [] },
+        });
+        return interaction.reply({ content: '✅ Posted to chat.', ephemeral: true });
+      } catch (err) {
+        logger.error({ err: err.message, matchId, userId: interaction.user.id }, 'keep_gold failed');
+        return interaction.reply({ content: `❌ Failed: ${err.message}`, ephemeral: true });
+      }
+    }
+
+    // Save Graph button on Match Over embeds — gated by allowed user IDs.
+    // Downloads the chart attachment from Discord's CDN and writes it to
+    // saved-graphs/<userId>/<matchId>.png on the bot host.
+    if (id.startsWith('save_gold_')) {
+      const matchId = id.slice('save_gold_'.length);
+      if (!config.saveGraphAllowedUserIds.has(interaction.user.id)) {
+        return interaction.reply({ content: '❌ You\'re not allowed to save graphs.', ephemeral: true });
+      }
+      const attachment = interaction.message?.attachments?.first();
+      if (!attachment?.url) {
+        return interaction.reply({ content: '❌ No graph attachment on this message.', ephemeral: true });
+      }
+      try {
+        const res = await fetch(attachment.url);
+        if (!res.ok) {
+          return interaction.reply({ content: `❌ Failed to fetch graph (HTTP ${res.status}).`, ephemeral: true });
+        }
+        const buf = Buffer.from(await res.arrayBuffer());
+        const dir = path.join('saved-graphs', interaction.user.id);
+        await mkdir(dir, { recursive: true });
+        const file = path.join(dir, `${matchId}.png`);
+        await writeFile(file, buf);
+        logger.info({ userId: interaction.user.id, matchId, bytes: buf.length, file }, 'saved gold graph');
+        return interaction.reply({ content: `✅ Saved to \`${file}\` (${(buf.length / 1024).toFixed(1)} KB).`, ephemeral: true });
+      } catch (err) {
+        logger.error({ err: err.message, matchId, userId: interaction.user.id }, 'save_gold failed');
+        return interaction.reply({ content: `❌ Save failed: ${err.message}`, ephemeral: true });
+      }
+    }
+
+    // Auto-bet button — opens a modal to set an auto-bet on this player
+    if (id.startsWith('autobet_')) {
+      const matchId = id.slice('autobet_'.length);
+      fileLog.info('autobet: button clicked', { matchId, userId: interaction.user.id, messageId: interaction.message?.id });
+
+      const modal = new ModalBuilder()
+        .setCustomId(`autobetmodal_${matchId}`)
+        .setTitle('Set Auto-Bet — applies every game');
+
+      const predInput = new TextInputBuilder()
+        .setCustomId('autobet_prediction')
+        .setLabel('win or lose?')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('win or lose')
+        .setRequired(true);
+
+      const amountInput = new TextInputBuilder()
+        .setCustomId('autobet_amount')
+        .setLabel('How many coins per game?')
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('e.g. 5000')
+        .setRequired(true);
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(predInput),
+        new ActionRowBuilder().addComponents(amountInput),
+      );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    // Parlay button — opens a multi-leg prediction modal
+    if (id.startsWith('parlay_place_')) {
+      const matchId = id.slice('parlay_place_'.length);
 
       if (!isBettingOpen(matchId)) {
         return interaction.reply({ content: '🔒 Betting is closed for this match.', ephemeral: true });
       }
 
-      const parley = getMatchParley(interaction.guildId, matchId);
-      if (!parley?.parley_stat) {
-        return interaction.reply({ content: '❌ No parley available for this match.', ephemeral: true });
+      const parlayLegs = getMatchParlay(interaction.guildId, matchId);
+      if (!parlayLegs || parlayLegs.length === 0) {
+        return interaction.reply({ content: '❌ No parlay available for this match.', ephemeral: true });
       }
 
+      const multiplier = Math.pow(2, parlayLegs.length);
       const modal = new ModalBuilder()
-        .setCustomId(`parleymodal_${prediction}_${matchId}`)
-        .setTitle(`Parley ${prediction.toUpperCase()} — Enter Amount`);
+        .setCustomId(`parlaymodal_${matchId}`)
+        .setTitle(`${parlayLegs.length}-Leg Parlay — ${multiplier}x if ALL hit`);
 
       const amountInput = new TextInputBuilder()
-        .setCustomId('bet_amount')
-        .setLabel('How many coins do you want to bet?')
+        .setCustomId('parlay_amount')
+        .setLabel('Amount to bet')
         .setStyle(TextInputStyle.Short)
         .setPlaceholder('e.g. 5000')
         .setRequired(true);
 
       modal.addComponents(new ActionRowBuilder().addComponents(amountInput));
+
+      for (let i = 0; i < parlayLegs.length; i++) {
+        const leg = parlayLegs[i];
+        const isYesNo = leg.type === 'yesno';
+        const label = isYesNo
+          ? `Leg ${i + 1}: ${leg.label} (yes / no)`
+          : `Leg ${i + 1}: ${leg.label} ${leg.line} (over / under)`;
+        const input = new TextInputBuilder()
+          .setCustomId(`parlay_leg_${i}`)
+          .setLabel(label.slice(0, 45))
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder(isYesNo ? 'yes or no' : 'over or under')
+          .setRequired(true);
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+      }
+
       await interaction.showModal(modal);
       return;
     }
@@ -225,8 +382,16 @@ client.on('interactionCreate', async (interaction) => {
 
       const user = ensureUser(guildId, userId);
 
+      let autoCollected = false;
       if (user.coins < amount) {
-        return interaction.reply({ content: `💰 Insufficient coins. You have **${user.coins.toLocaleString()}** 🪙.`, ephemeral: true });
+        const collected = tryAutoCollect(guildId, userId, user);
+        if (collected !== null) {
+          user.coins = collected;
+          autoCollected = true;
+        }
+        if (user.coins < amount) {
+          return interaction.reply({ content: `💰 Insufficient coins. You have **${user.coins.toLocaleString()}** 🪙.`, ephemeral: true });
+        }
       }
 
       const existing = getUserBetOnMatch(guildId, userId, matchId);
@@ -238,17 +403,101 @@ client.on('interactionCreate', async (interaction) => {
       placeBet(guildId, userId, matchId, match.puuid, prediction, amount);
 
       const emoji = prediction === 'win' ? '🟢' : '🔴';
+      const collectNote = autoCollected ? `\n🪙 Auto-collected **${config.collectAmount.toLocaleString()}** coins!` : '';
       return interaction.reply(
-        `${emoji} **${interaction.user.username}** bet **${prediction.toUpperCase()}** for **${amount.toLocaleString()}** 🪙`
+        `${emoji} **${interaction.user.username}** bet **${prediction.toUpperCase()}** for **${amount.toLocaleString()}** 🪙${collectNote}`
       );
     }
 
-    // Parley modal
-    if (id.startsWith('parleymodal_')) {
-      const prediction = id.split('_')[1];
-      const matchId = id.slice(`parleymodal_${prediction}_`.length);
+    // Auto-bet modal — save user's auto-bet for the player from this message
+    if (id.startsWith('autobetmodal_')) {
+      const matchId = id.slice('autobetmodal_'.length);
 
-      const amountStr = interaction.fields.getTextInputValue('bet_amount');
+      const predRaw = interaction.fields.getTextInputValue('autobet_prediction').trim().toLowerCase();
+      const amountStr = interaction.fields.getTextInputValue('autobet_amount');
+      const messageId = interaction.message?.id;
+      fileLog.info('autobet: modal submitted', { matchId, userId: interaction.user.id, messageId, predRaw, amountStr });
+
+      if (predRaw !== 'win' && predRaw !== 'lose') {
+        fileLog.warn('autobet: invalid prediction, rejecting', { predRaw });
+        return interaction.reply({ content: '❌ Type **win** or **lose**.', ephemeral: true });
+      }
+      const amount = parseInt(amountStr, 10);
+      if (isNaN(amount) || amount <= 0) {
+        fileLog.warn('autobet: invalid amount, rejecting', { amountStr });
+        return interaction.reply({ content: '❌ Enter a valid positive number.', ephemeral: true });
+      }
+
+      const guildId = interaction.guildId;
+      const userId = interaction.user.id;
+
+      // Resolve which tracked player this message refers to (handles duo: each
+      // tracked player in the same match has its own message_id).
+      const rowByMsg = messageId ? getActiveMatchByMessageId(guildId, messageId) : null;
+      const rowByMatch = !rowByMsg ? getActiveMatchByMatchId(guildId, matchId) : null;
+      const row = rowByMsg || rowByMatch;
+      fileLog.info('autobet: active_match lookup', { matchId, messageId, lookupBy: rowByMsg ? 'message_id' : (rowByMatch ? 'match_id' : 'none'), foundPuuid: row?.puuid ?? null });
+
+      if (!row) {
+        fileLog.warn('autobet: no active match row found, aborting', { matchId, messageId });
+        return interaction.reply({ content: '❌ This match is no longer active.', ephemeral: true });
+      }
+
+      const player = getAllTrackedPlayers().find(p => p.guild_id === guildId && p.puuid === row.puuid);
+      const playerLabel = player ? `**${displayTag(player.riot_tag)}**` : 'this player';
+
+      const user = ensureUser(guildId, userId);
+      const writeResult = setAutoBet(guildId, userId, row.puuid, predRaw, amount);
+      fileLog.info('autobet: setAutoBet executed', { guildId, userId, puuid: row.puuid, riotTag: player?.riot_tag, predRaw, amount, changes: writeResult.changes, lastInsertRowid: writeResult.lastInsertRowid });
+
+      const emoji = predRaw === 'win' ? '🟢' : '🔴';
+      const autobetLine = `🟡 Auto-bet set: ${emoji} **${predRaw.toUpperCase()}** for **${amount.toLocaleString()}** 🪙 every game on ${playerLabel}.`;
+
+      // Also try to place a bet on the current match
+      let currentBetPlaced = false;
+      let currentBetSkipReason = null;
+      let autoCollected = false;
+
+      if (!isBettingOpen(matchId)) {
+        currentBetSkipReason = '🔒 Betting closed for this match — autobet will fire next game.';
+      } else if (getUserBetOnMatch(guildId, userId, matchId)) {
+        currentBetSkipReason = '⚠️ You already have a bet on this match — autobet saved for future games.';
+      } else {
+        if (user.coins < amount) {
+          const collected = tryAutoCollect(guildId, userId, user);
+          if (collected !== null) {
+            user.coins = collected;
+            autoCollected = true;
+          }
+        }
+        if (user.coins < amount) {
+          currentBetSkipReason = `💰 Not enough coins to bet on this match (have **${user.coins.toLocaleString()}** 🪙) — autobet saved for future games.`;
+        } else {
+          deductCoins(guildId, userId, amount);
+          placeBet(guildId, userId, matchId, row.puuid, predRaw, amount);
+          currentBetPlaced = true;
+          fileLog.info('autobet: also placed bet on current match', { matchId, userId, puuid: row.puuid, predRaw, amount });
+        }
+      }
+
+      if (currentBetPlaced) {
+        const collectNote = autoCollected ? `\n🪙 Auto-collected **${config.collectAmount.toLocaleString()}** coins!` : '';
+        return interaction.reply({
+          content: `${autobetLine}\n${emoji} **${interaction.user.username}** also bet **${predRaw.toUpperCase()}** on this match for **${amount.toLocaleString()}** 🪙${collectNote}`,
+        });
+      }
+
+      return interaction.reply({
+        content: `${autobetLine}\n${currentBetSkipReason}`,
+        ephemeral: true,
+      });
+    }
+
+    // Parlay modal — multi-leg, all must hit
+    if (id.startsWith('parlaymodal_')) {
+      const matchId = id.slice('parlaymodal_'.length);
+
+      const amountStr = interaction.fields.getTextInputValue('parlay_amount');
       const amount = parseInt(amountStr, 10);
 
       if (isNaN(amount) || amount <= 0) {
@@ -267,36 +516,61 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: '❌ This match is no longer active.', ephemeral: true });
       }
 
-      const parley = getMatchParley(guildId, matchId);
-      if (!parley?.parley_stat) {
-        return interaction.reply({ content: '❌ No parley available for this match.', ephemeral: true });
+      const parlayLegs = getMatchParlay(guildId, matchId);
+      if (!parlayLegs || parlayLegs.length === 0) {
+        return interaction.reply({ content: '❌ No parlay available for this match.', ephemeral: true });
+      }
+
+      // Parse and validate each leg prediction
+      const predictions = [];
+      for (let i = 0; i < parlayLegs.length; i++) {
+        const leg = parlayLegs[i];
+        const raw = interaction.fields.getTextInputValue(`parlay_leg_${i}`).trim().toLowerCase();
+        const isYesNo = leg.type === 'yesno';
+        if (isYesNo) {
+          if (raw === 'yes') predictions.push('over');
+          else if (raw === 'no') predictions.push('under');
+          else return interaction.reply({ content: `❌ Leg ${i + 1} (${leg.label}): type **yes** or **no**.`, ephemeral: true });
+        } else {
+          if (raw === 'over') predictions.push('over');
+          else if (raw === 'under') predictions.push('under');
+          else return interaction.reply({ content: `❌ Leg ${i + 1} (${leg.label}): type **over** or **under**.`, ephemeral: true });
+        }
       }
 
       const user = ensureUser(guildId, userId);
 
+      let autoCollected = false;
       if (user.coins < amount) {
-        return interaction.reply({ content: `💰 Insufficient coins. You have **${user.coins.toLocaleString()}** 🪙.`, ephemeral: true });
+        const collected = tryAutoCollect(guildId, userId, user);
+        if (collected !== null) {
+          user.coins = collected;
+          autoCollected = true;
+        }
+        if (user.coins < amount) {
+          return interaction.reply({ content: `💰 Insufficient coins. You have **${user.coins.toLocaleString()}** 🪙.`, ephemeral: true });
+        }
       }
 
       const existing = getUserParleyBetOnMatch(guildId, userId, matchId);
       if (existing) {
-        return interaction.reply({ content: `⚠️ You already placed a parley bet (**${existing.prediction.toUpperCase()}**, ${existing.amount.toLocaleString()} 🪙) on this match.`, ephemeral: true });
+        return interaction.reply({ content: '⚠️ You already placed a parlay bet on this match.', ephemeral: true });
       }
 
       deductCoins(guildId, userId, amount);
-      placeParleyBet(guildId, userId, matchId, prediction, amount);
+      placeParleyBet(guildId, userId, matchId, predictions, amount);
 
-      const isYesNo = parley.parley_stat === 'firstBlood' || parley.parley_stat === 'tripleKill';
-      let betEmoji, displayPrediction;
-      if (isYesNo) {
-        betEmoji = prediction === 'over' ? '✅' : '❌';
-        displayPrediction = prediction === 'over' ? 'YES' : 'NO';
-      } else {
-        betEmoji = prediction === 'over' ? '⬆️' : '⬇️';
-        displayPrediction = prediction.toUpperCase();
-      }
+      const multiplier = Math.pow(2, parlayLegs.length);
+      const legSummary = predictions.map((pred, i) => {
+        const leg = parlayLegs[i];
+        const isYesNo = leg.type === 'yesno';
+        const display = isYesNo ? (pred === 'over' ? 'YES' : 'NO') : pred.toUpperCase();
+        return `Leg ${i + 1} ${leg.label}: **${display}**`;
+      }).join('\n');
+
+      const collectNote = autoCollected ? `\n🪙 Auto-collected **${config.collectAmount.toLocaleString()}** coins!` : '';
       return interaction.reply(
-        `${betEmoji} **${interaction.user.username}** parley bet **${displayPrediction}** for **${amount.toLocaleString()}** 🪙`
+        `🎰 **${interaction.user.username}** placed a **${parlayLegs.length}-leg parlay** for **${amount.toLocaleString()}** 🪙 (${multiplier}x if ALL hit!)\n${legSummary}${collectNote}`
       );
     }
   }
