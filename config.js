@@ -99,6 +99,17 @@ const config = {
     '189717256438022145',
     '188477218739978252',
   ]),
+
+  // "The House" — automated bettor that places a bet on every match based on
+  // rank-skill delta. The fake discord_id never collides with a real one.
+  house: {
+    id: '0',
+    name: 'The House',
+    label: '🏛️ The House',
+    bet: 1000,
+    topupTo: 1_000_000,
+    edgeThreshold: 0.52,
+  },
 };
 
 export default config;

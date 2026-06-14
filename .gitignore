@@ -18,3 +18,7 @@ saved-graphs/
 
 # Local AI tool state
 .claude/
+
+# Runtime asset caches (auto-downloaded by the bot)
+assets/champions/
+data/

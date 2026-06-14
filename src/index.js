@@ -1,6 +1,4 @@
 import 'dotenv/config';
-import { writeFile, mkdir } from 'node:fs/promises';
-import path from 'node:path';
 import {
   Client, GatewayIntentBits, Collection, REST, Routes,
   ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder,
@@ -9,7 +7,6 @@ import logger from './utils/logger.js';
 import { fileLog } from './utils/fileLog.js';
 import { isRateLimited } from './utils/ratelimit.js';
 import { startPoller } from './poller.js';
-import { startCleanupSchedule } from './cleanup.js';
 import { displayTag } from './utils/displayName.js';
 import {
   ensureUser,
@@ -39,9 +36,9 @@ import * as baltop from './commands/baltop.js';
 import * as stats from './commands/stats.js';
 import * as rank from './commands/rank.js';
 import * as bethere from './commands/bethere.js';
-import * as peak from './commands/peak.js';
 import * as records from './commands/records.js';
 import * as lp from './commands/lp.js';
+import * as lpc from './commands/lpc.js';
 import * as autobet from './commands/autobet.js';
 import * as removeuser from './commands/removeuser.js';
 import * as give from './commands/give.js';
@@ -50,6 +47,8 @@ import * as history from './commands/history.js';
 import * as achievements from './commands/achievements.js';
 import * as help from './commands/help.js';
 import * as duo from './commands/duo.js';
+import * as predict10 from './commands/predict10.js';
+import * as predictions from './commands/predictions.js';
 
 function tryAutoCollect(guildId, userId, user) {
   const now = new Date();
@@ -79,7 +78,7 @@ if (!RIOT_API_KEY) {
 
 // ── Build command collection ─────────────────────────────────────────────────
 
-const commands = [collect, adduser, removeuser, bet, baltop, stats, rank, bethere, peak, records, lp, autobet, give, emoji, history, achievements, help, duo];
+const commands = [collect, adduser, removeuser, bet, baltop, stats, rank, bethere, records, lp, lpc, autobet, give, emoji, history, achievements, help, duo, predict10, predictions];
 const commandCollection = new Collection();
 for (const cmd of commands) {
   commandCollection.set(cmd.data.name, cmd);
@@ -139,7 +138,6 @@ client.once('ready', async () => {
   await registerCommands(client.user.id);
   await refreshPuuids();
   startPoller(client);
-  startCleanupSchedule(client);
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -177,6 +175,11 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
     return;
+  }
+
+  // ── /predict10 component flow (string selects + confirm button) ──────────
+  if (interaction.isStringSelectMenu() || (interaction.isButton() && interaction.customId.startsWith('predict10_'))) {
+    if (await predict10.handleComponent(interaction)) return;
   }
 
   // ── Button clicks (bet_win / bet_lose / parley_over / parley_under) ─────
@@ -242,37 +245,6 @@ client.on('interactionCreate', async (interaction) => {
       } catch (err) {
         logger.error({ err: err.message, matchId, userId: interaction.user.id }, 'keep_gold failed');
         return interaction.reply({ content: `❌ Failed: ${err.message}`, ephemeral: true });
-      }
-    }
-
-    // Save Graph button on Match Over embeds — gated by allowed user IDs.
-    // Downloads the chart attachment from Discord's CDN and writes it to
-    // saved-graphs/<userId>/<matchId>.png on the bot host.
-    if (id.startsWith('save_gold_')) {
-      const matchId = id.slice('save_gold_'.length);
-      if (!config.saveGraphAllowedUserIds.has(interaction.user.id)) {
-        return interaction.reply({ content: '❌ You\'re not allowed to save graphs.', ephemeral: true });
-      }
-      const url = interaction.message?.attachments?.first()?.url
-                || interaction.message?.embeds?.[0]?.image?.url;
-      if (!url) {
-        return interaction.reply({ content: '❌ No graph found on this message.', ephemeral: true });
-      }
-      try {
-        const res = await fetch(url);
-        if (!res.ok) {
-          return interaction.reply({ content: `❌ Failed to fetch graph (HTTP ${res.status}).`, ephemeral: true });
-        }
-        const buf = Buffer.from(await res.arrayBuffer());
-        const dir = path.join('saved-graphs', interaction.user.id);
-        await mkdir(dir, { recursive: true });
-        const file = path.join(dir, `${matchId}.png`);
-        await writeFile(file, buf);
-        logger.info({ userId: interaction.user.id, matchId, bytes: buf.length, file }, 'saved gold graph');
-        return interaction.reply({ content: `✅ Saved to \`${file}\` (${(buf.length / 1024).toFixed(1)} KB).`, ephemeral: true });
-      } catch (err) {
-        logger.error({ err: err.message, matchId, userId: interaction.user.id }, 'save_gold failed');
-        return interaction.reply({ content: `❌ Save failed: ${err.message}`, ephemeral: true });
       }
     }
 

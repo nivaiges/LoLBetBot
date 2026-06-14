@@ -1,5 +1,6 @@
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 import { getTopUsers } from '../db.js';
+import config from '../../config.js';
 
 export const data = new SlashCommandBuilder()
   .setName('baltop')
@@ -15,7 +16,8 @@ export async function execute(interaction) {
 
   const lines = top.map((u, i) => {
     const medal = i < 3 ? ['🥇', '🥈', '🥉'][i] : `**${i + 1}.**`;
-    return `${medal} <@${u.discord_id}> — ${u.coins.toLocaleString()} 🪙 (${u.correct}W/${u.incorrect}L)`;
+    const label = u.discord_id === config.house.id ? `**${config.house.label}**` : `<@${u.discord_id}>`;
+    return `${medal} ${label} — ${u.coins.toLocaleString()} 🪙 (${u.correct}W/${u.incorrect}L)`;
   });
 
   const embed = new EmbedBuilder()

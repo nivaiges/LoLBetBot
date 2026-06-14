@@ -3,8 +3,9 @@ import config from '../config.js';
 import logger from './utils/logger.js';
 import { fileLog } from './utils/fileLog.js';
 import { peakLog } from './utils/peakLog.js';
-import { getActiveGame, getMatchResult, getMatchTimeline, getRankedStatsByPuuid, loadChampionMap, getChampionName } from './riot.js';
-import { computeTeamGoldLead, renderGoldLeadPng, extractObjectiveEvents, computeWonLane, extractTrackedPlayerKills } from './matchGraph.js';
+import { getActiveGame, getMatchResult, getMatchTimeline, getRankedStatsByPuuid, loadChampionMap, getChampionName, getChampionInternalId } from './riot.js';
+import { computeTeamGoldLead, extractObjectiveEvents, computeWonLane, extractTrackedPlayerKills, renderTeamsCompositePng, renderMatchOverPng } from './matchGraph.js';
+import { loadPlayRates, inferLanes } from './utils/laneInfer.js';
 import { registerBettingWindow } from './utils/bettingwindow.js';
 import {
   getAllTrackedPlayers,
@@ -34,7 +35,6 @@ import {
   setLastMatchOverMessage,
   getLastMatchOverMessage,
   clearLastMatchOverMessage,
-  appendActiveMatchExtraMessage,
   getActiveMatchExtraMessages,
   ensureUser,
   getUser,
@@ -44,15 +44,29 @@ import {
   isEmojiEnabled,
   checkAchievements,
   recordDuoResult,
+  addCoins,
+  getOpenPredict10ForPlayer,
+  updatePredict10Progress,
+  settlePredict10,
 } from './db.js';
 
 let client = null;
 let pollTimer = null;
 let tickInProgress = false;
 
+// Cache the team-composite PNG per matchId so closeBetting can re-attach the
+// exact original image when it edits to "BETTING CLOSED" (re-fetching the
+// embed's CDN url server-side returns a blank/transformed image). Cleared on
+// match end. Memory cost is trivial — a few ~30 KB buffers at most.
+const teamsPngByMatch = new Map();
+// u.gg multisearch URL per matchId — reused by closeBetting so the BETTING
+// CLOSED message keeps a single u.gg button.
+const uggUrlByMatch = new Map();
+
 export async function startPoller(discordClient) {
   client = discordClient;
   await loadChampionMap();
+  await loadPlayRates(); // Meraki play-rate data for lane inference
   logger.info({ intervalMs: config.pollIntervalMs }, 'Starting match poller');
   pollTimer = setInterval(pollTick, config.pollIntervalMs);
   pollTick();
@@ -89,8 +103,51 @@ function getDisplayName(riotTag) {
   return name;
 }
 
+// Resolve a Discord user ID to a readable name for rendered images (where
+// <@id> mentions don't work). Tries the guild member cache, then the user
+// cache, then falls back to a short form of the ID.
+async function resolveDiscordName(guildId, discordId) {
+  if (discordId === HOUSE_ID) return HOUSE_LABEL;
+  try {
+    const guild = client?.guilds.cache.get(guildId);
+    const member = guild?.members.cache.get(discordId) || (guild ? await guild.members.fetch(discordId).catch(() => null) : null);
+    if (member) return member.displayName;
+    const user = client?.users.cache.get(discordId);
+    if (user) return user.username;
+  } catch { /* fall through */ }
+  return 'Someone';
+}
+
 const TIERS = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'MASTER', 'GRANDMASTER', 'CHALLENGER'];
 const DIVISIONS = ['IV', 'III', 'II', 'I'];
+
+// Spectator-V5 gameQueueConfigId → readable name for the Match Detected header.
+const QUEUE_NAMES = {
+  400: 'Normal Draft',
+  420: 'Ranked Solo/Duo',
+  430: 'Normal Blind',
+  440: 'Ranked Flex',
+  450: 'ARAM',
+  490: 'Quickplay',
+  700: 'Clash',
+  720: 'ARAM Clash',
+  830: 'Co-op vs AI',
+  840: 'Co-op vs AI',
+  850: 'Co-op vs AI',
+  900: 'ARURF',
+  1020: 'One for All',
+  1700: 'Arena',
+  1900: 'URF',
+};
+function queueName(game) {
+  return QUEUE_NAMES[game?.gameQueueConfigId] || game?.gameMode || 'Custom';
+}
+
+// Queue IDs we deliberately don't post Match Detected / Match Over for.
+const SKIP_QUEUES = new Set([
+  1700, // Arena
+  830, 840, 850, // Co-op vs AI
+]);
 
 const PARLEY_POOL = [
   { stat: 'kills', label: 'Kills', type: 'ou', min: 3.5, max: 8.5, step: 1 },
@@ -113,6 +170,34 @@ function rankToValue(tier, division) {
   if (tierIdx >= 7) return tierIdx * 4; // MASTER+ have no divisions
   return tierIdx * 4 + DIVISIONS.indexOf(division);
 }
+
+// "The House" — automated bettor. Logistic rank-skill model; bets only when
+// confidence is past config.house.edgeThreshold. Config in config.js.
+const HOUSE_ID = config.house.id;
+const HOUSE_LABEL = config.house.label;
+const HOUSE_BET = config.house.bet;
+const HOUSE_TOPUP_TO = config.house.topupTo;
+const UNRANKED_SKILL = 14;
+
+function computeHouseBet(participants, trackedTeamId) {
+  const skill = (p) => {
+    const v = rankToValue(p.tier, p.rank);
+    return v == null ? UNRANKED_SKILL : v;
+  };
+  const blue = participants.filter(p => p.teamId === 100);
+  const red = participants.filter(p => p.teamId === 200);
+  if (blue.length === 0 || red.length === 0) return null;
+  const blueAvg = blue.reduce((s, p) => s + skill(p), 0) / blue.length;
+  const redAvg = red.reduce((s, p) => s + skill(p), 0) / red.length;
+  const trackedAvg = trackedTeamId === 100 ? blueAvg : redAvg;
+  const enemyAvg = trackedTeamId === 100 ? redAvg : blueAvg;
+  const pWin = 1 / (1 + Math.exp(-0.15 * (trackedAvg - enemyAvg)));
+  const t = config.house.edgeThreshold;
+  if (pWin >= t) return { prediction: 'win', confidence: pWin };
+  if (pWin <= 1 - t) return { prediction: 'lose', confidence: 1 - pWin };
+  return null;
+}
+
 
 function valueToRank(value, guildId) {
   let tier, display;
@@ -143,7 +228,7 @@ async function getRankValue(puuid, region) {
     return null;
   }
   logger.debug({ puuid, tier: solo.tier, rank: solo.rank }, 'getRankValue: success');
-  return rankToValue(solo.tier, solo.rank);
+  return { value: rankToValue(solo.tier, solo.rank), tier: solo.tier, rank: solo.rank, lp: solo.leaguePoints };
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -152,8 +237,13 @@ async function getAverageRank(participants, region, guildId) {
   // Query all participants — we have headroom on the personal-tier rate limits.
   const values = [];
   for (const p of participants) {
-    const v = await getRankValue(p.puuid, region);
-    if (v !== null) values.push(v);
+    const r = await getRankValue(p.puuid, region);
+    if (r !== null) {
+      values.push(r.value);
+      p.tier = r.tier;   // used for the icon outline color + LP tag
+      p.rank = r.rank;   // division (e.g. "II"); null for master+
+      p.lp = r.lp;       // league points
+    }
     await sleep(150); // ~6 req/sec, well under personal limits
   }
   if (values.length === 0) return 'Unranked';
@@ -197,6 +287,12 @@ async function checkForNewMatches() {
 
     const matchId = `${player.region.toUpperCase()}_${game.gameId}`;
 
+    // Skip game modes we don't want to track (e.g. Arena, Co-op vs AI).
+    if (SKIP_QUEUES.has(game.gameQueueConfigId)) {
+      peakLog.info('spectator: skipped queue', { riotTag: player.riot_tag, queue: game.gameQueueConfigId });
+      continue;
+    }
+
     const result = upsertActiveMatch(player.guild_id, player.puuid, matchId);
     if (result.changes > 0) {
       const name = getDisplayName(player.riot_tag);
@@ -214,28 +310,50 @@ async function checkForNewMatches() {
       }
 
       const participants = game.participants || [];
-      const avgRank = await getAverageRank(participants, player.region, player.guild_id);
+      // Side effect: stamps each participant with tier/rank/lp (used for the
+      // icon ring colors + LP bubbles). The returned avg string is unused now
+      // that the header shows the game mode instead.
+      await getAverageRank(participants, player.region, player.guild_id);
 
-      // Identify tracked player's team and build team displays
+      // Identify tracked player's team
       const trackedP = participants.find(p => p.puuid === player.puuid);
       const trackedTeamId = trackedP?.teamId || 100;
       const trackedChamp = trackedP ? getChampionName(trackedP.championId) : null;
-      const sideLabel = trackedTeamId === 100 ? '🔵 Blue Side' : '🔴 Red Side';
-      const allies = participants.filter(p => p.teamId === trackedTeamId);
-      const enemies = participants.filter(p => p.teamId !== trackedTeamId);
-      const formatTeam = (team) => team.map(p => {
-        const champ = getChampionName(p.championId);
-        return p.puuid === player.puuid ? `**${champ}** (${name})` : champ;
-      }).join(', ');
+      const sideEmoji = trackedTeamId === 100 ? '🔵' : '🔴';
+      const sideName = trackedTeamId === 100 ? 'Blue' : 'Red';
+      const sideColor = trackedTeamId === 100 ? 0x5DADE2 : 0xE74C3C;
+
+      const blueTeam = participants.filter(p => p.teamId === 100);
+      const redTeam = participants.filter(p => p.teamId === 200);
+
+      // Lane inference per team — uses Meraki play-rate data. Falls back to
+      // API order when inference is unavailable (no play-rate data, missing
+      // champions, etc.).
+      const orderByLane = (team) => {
+        const ids = team.map(p => p.championId);
+        const lanes = inferLanes(ids);
+        if (!lanes) return team;
+        const ordered = [];
+        for (const pos of ['TOP', 'JUNGLE', 'MIDDLE', 'BOTTOM', 'UTILITY']) {
+          const champId = lanes[pos];
+          const p = team.find(x => x.championId === champId);
+          if (p && !ordered.includes(p)) ordered.push(p);
+        }
+        // Append any stragglers (shouldn't happen but defensive)
+        for (const p of team) if (!ordered.includes(p)) ordered.push(p);
+        return ordered;
+      };
+
+      const blueOrdered = orderByLane(blueTeam);
+      const redOrdered = orderByLane(redTeam);
 
       // Roll for parlay (multi-leg prop bet — 2 to 4 legs, ALL must hit to win)
-      // If another tracked player in the same game already generated a parlay, reuse it
       const existingParlay = getMatchParlay(player.guild_id, matchId);
       let parlayLegs = null;
       if (existingParlay) {
         parlayLegs = existingParlay;
       } else if (Math.random() < config.parleyChance) {
-        const legCount = 2 + Math.floor(Math.random() * 3); // 2, 3, or 4 legs
+        const legCount = 2 + Math.floor(Math.random() * 3);
         const shuffled = [...PARLEY_POOL].sort(() => 0.5 - Math.random());
         const picks = shuffled.slice(0, legCount);
         parlayLegs = picks.map(pick => {
@@ -252,28 +370,117 @@ async function checkForNewMatches() {
         logger.info({ matchId, legs: parlayLegs.length }, 'Parlay generated for match');
       }
 
-      const titleChamp = trackedChamp ? ` — playing ${trackedChamp}` : '';
-      const embed = new EmbedBuilder()
-        .setTitle('🎮 Match Detected!')
-        .setDescription(`**${name}**${titleChamp} (${sideLabel})\n\n⏰ Betting closes in **5 minutes** — place your bets!\n🟢 WIN pays **${config.payoutMultiplier}x** · 🔴 LOSE pays **${config.losePayoutMultiplier}x**`)
-        .addFields(
-          { name: '📊 Avg Rank', value: avgRank, inline: true },
-          { name: `🔵 ${name}'s Team`, value: formatTeam(allies) || 'Unknown', inline: false },
-          { name: '🔴 Enemy Team', value: formatTeam(enemies) || 'Unknown', inline: false },
-        )
-        .setColor(0x2ecc71)
-        .setTimestamp();
+      // Label resolver — tracked player uses their known tag; others use the
+      // Spectator riotId game name when present (empty under streamer mode),
+      // falling back to the champion name.
+      const labelFor = (p) => {
+        if (p.puuid === player.puuid) return getDisplayName(player.riot_tag);
+        const gameName = (p.riotId || '').split('#')[0].trim();
+        return gameName || getChampionName(p.championId);
+      };
 
-      if (parlayLegs) {
-        const multiplier = Math.pow(config.parleyPayoutMultiplier, parlayLegs.length);
-        const legDesc = parlayLegs.map((leg, i) => {
-          if (leg.type === 'yesno') return `**Leg ${i + 1}:** ${leg.label} — YES or NO`;
-          return `**Leg ${i + 1}:** ${leg.label} — Over/Under **${leg.line}**`;
-        }).join('\n');
-        embed.addFields({ name: `🎲 PARLAY — ${parlayLegs.length} Legs (${multiplier}x if ALL hit!)`, value: legDesc, inline: false });
+      // Process auto-bets up front so they can be baked into the image. Each
+      // resolves to a plain line (no mentions) for the AUTO-BETS footer.
+      const autoBetEntries = getAutoBetsForMatch(player.guild_id, player.puuid);
+      const guild = client?.guilds.cache.get(player.guild_id);
+      const autoBetLines = [];
+      for (const ab of autoBetEntries) {
+        if (getUserBetOnMatch(player.guild_id, ab.discord_id, matchId)) continue;
+
+        let displayName = 'User';
+        try {
+          const member = guild?.members.cache.get(ab.discord_id) || await guild?.members.fetch(ab.discord_id);
+          displayName = member?.displayName || member?.user.username || 'User';
+        } catch { /* member left guild — fall back */ }
+
+        const user = ensureUser(player.guild_id, ab.discord_id);
+        if (user.coins < ab.amount) {
+          autoBetLines.push(`• ${displayName} — skipped (low coins)`);
+          continue;
+        }
+        deductCoins(player.guild_id, ab.discord_id, ab.amount);
+        placeBet(player.guild_id, ab.discord_id, matchId, player.puuid, ab.prediction, ab.amount);
+        const mult = ab.prediction === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier;
+        const potential = Math.floor(ab.amount * mult);
+        autoBetLines.push(`• ${displayName} — bet ${ab.prediction.toUpperCase()} ${ab.amount.toLocaleString()} 🪙 → win ${potential.toLocaleString()} 🪙`);
       }
 
-      const row = new ActionRowBuilder().addComponents(
+      // The House — automated rank-skill bettor.
+      const houseChoice = computeHouseBet(participants, trackedTeamId);
+      if (houseChoice && !getUserBetOnMatch(player.guild_id, HOUSE_ID, matchId)) {
+        ensureUser(player.guild_id, HOUSE_ID);
+        const houseUser = getUser(player.guild_id, HOUSE_ID);
+        if (houseUser.coins < HOUSE_BET) {
+          addCoins(player.guild_id, HOUSE_ID, HOUSE_TOPUP_TO - houseUser.coins);
+        }
+        deductCoins(player.guild_id, HOUSE_ID, HOUSE_BET);
+        placeBet(player.guild_id, HOUSE_ID, matchId, player.puuid, houseChoice.prediction, HOUSE_BET, houseChoice.confidence);
+        const hMult = houseChoice.prediction === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier;
+        const hPotential = Math.floor(HOUSE_BET * hMult);
+        const conf = Math.round(houseChoice.confidence * 100);
+        autoBetLines.push(`• ${HOUSE_LABEL} (${conf}%) — bet ${houseChoice.prediction.toUpperCase()} ${HOUSE_BET.toLocaleString()} 🪙 → win ${hPotential.toLocaleString()} 🪙`);
+      }
+
+      // Parlay summary for the image (label + legs line).
+      let parlayInfo = null;
+      if (parlayLegs) {
+        const multiplier = Math.pow(config.parleyPayoutMultiplier, parlayLegs.length);
+        const legSummary = parlayLegs.map(leg => {
+          if (leg.type === 'yesno') return `${leg.label} Y/N`;
+          return `${leg.label} O/U ${leg.line}`;
+        }).join(' · ');
+        parlayInfo = {
+          label: `🎰 PARLAY · ${parlayLegs.length} LEGS · ${multiplier}× PAYOUT`,
+          legs: legSummary,
+        };
+      }
+
+      // Bans from Spectator-V5 — sorted by pickTurn so they render left→right
+      // in the order they were banned.
+      const banned = (game.bannedChampions || [])
+        .slice()
+        .sort((a, b) => a.pickTurn - b.pickTurn);
+      const blueBans = banned.filter(b => b.teamId === 100).map(b => b.championId);
+      const redBans = banned.filter(b => b.teamId === 200).map(b => b.championId);
+
+      // Build the team composite PNG (header + per-team labels + parlay/auto-bet cards)
+      const teamsPng = await renderTeamsCompositePng({
+        blueTeam: blueOrdered,
+        redTeam: redOrdered,
+        trackedPuuid: player.puuid,
+        getChampionInternalId,
+        getChampionName,
+        getLabel: labelFor,
+        title: 'MATCH DETECTED',
+        subtitle: `${name}${trackedChamp ? ` on ${trackedChamp}` : ''}`,
+        side: sideName,
+        sideColor: trackedTeamId === 100 ? '#5DADE2' : '#e74c3c',
+        gameMode: queueName(game),
+        parlay: parlayInfo,
+        autoBets: autoBetLines,
+        blueBans,
+        redBans,
+        teamLabels: true,
+        autoBetStyle: 'card',
+      });
+
+      const embed = new EmbedBuilder()
+        .setColor(sideColor)
+        .setFooter({ text: `⏰ Bets close in 5 minutes · WIN ${config.payoutMultiplier}× · LOSE ${config.losePayoutMultiplier}×` });
+      if (teamsPng) embed.setImage('attachment://teams.png');
+
+      // u.gg multisearch link — opens all 10 players side-by-side. Uses the
+      // tracked player's known riot_tag and each other participant's riotId
+      // (Spectator-V5 hides riotId in streamer mode → those players skipped).
+      const multiTags = participants
+        .map(p => p.puuid === player.puuid ? player.riot_tag : (p.riotId || ''))
+        .filter(t => t && t.includes('#'))
+        .map(t => encodeURIComponent(t));
+      const uggUrl = multiTags.length > 0
+        ? `https://u.gg/lol/multisearch?region=${player.region.toLowerCase()}&summoners=${multiTags.join(',')}`
+        : null;
+
+      const rowComponents = [
         new ButtonBuilder()
           .setCustomId(`bet_win_${matchId}`)
           .setLabel('🟢 WIN')
@@ -286,7 +493,16 @@ async function checkForNewMatches() {
           .setCustomId(`autobet_${matchId}`)
           .setLabel('🟡 Auto-bet')
           .setStyle(ButtonStyle.Secondary),
-      );
+      ];
+      if (uggUrl) {
+        rowComponents.push(
+          new ButtonBuilder()
+            .setLabel('🔗 u.gg')
+            .setStyle(ButtonStyle.Link)
+            .setURL(uggUrl),
+        );
+      }
+      const row = new ActionRowBuilder().addComponents(...rowComponents);
 
       const components = [row];
       if (parlayLegs) {
@@ -299,46 +515,18 @@ async function checkForNewMatches() {
         components.push(parlayRow);
       }
 
-      const msg = await sendToGuild(player.guild_id, { embeds: [embed], components });
+      const sendPayload = { embeds: [embed], components };
+      if (uggUrl) uggUrlByMatch.set(matchId, uggUrl);
+      if (teamsPng) {
+        sendPayload.files = [{ attachment: teamsPng, name: 'teams.png' }];
+        teamsPngByMatch.set(matchId, teamsPng);
+      }
+      const msg = await sendToGuild(player.guild_id, sendPayload);
       if (msg) {
         setMatchMessageId(player.guild_id, player.puuid, matchId, msg.id);
         fileLog.info('Match embed sent, message ID saved', { matchId, guildId: player.guild_id, messageId: msg.id });
       } else {
         fileLog.warn('Match embed send returned null — message ID not saved', { matchId, guildId: player.guild_id });
-      }
-
-      // Process auto-bets
-      const autoBets = getAutoBetsForMatch(player.guild_id, player.puuid);
-      const guild = client?.guilds.cache.get(player.guild_id);
-      for (const ab of autoBets) {
-        const existing = getUserBetOnMatch(player.guild_id, ab.discord_id, matchId);
-        if (existing) continue;
-
-        let displayName = 'User';
-        try {
-          const member = guild?.members.cache.get(ab.discord_id) || await guild?.members.fetch(ab.discord_id);
-          displayName = member?.displayName || member?.user.username || 'User';
-        } catch { /* member left guild — fall back */ }
-
-        const user = ensureUser(player.guild_id, ab.discord_id);
-        if (user.coins < ab.amount) {
-          const skipMsg = await sendToGuild(player.guild_id, {
-            content: `🤖 Auto-bet skipped for ${displayName} — insufficient coins (need **${ab.amount.toLocaleString()}** 🪙, have **${user.coins.toLocaleString()}** 🪙)`,
-            allowedMentions: { parse: [] },
-          });
-          if (skipMsg) appendActiveMatchExtraMessage(player.guild_id, player.puuid, matchId, skipMsg.id);
-          continue;
-        }
-
-        deductCoins(player.guild_id, ab.discord_id, ab.amount);
-        placeBet(player.guild_id, ab.discord_id, matchId, player.puuid, ab.prediction, ab.amount);
-
-        const emoji = ab.prediction === 'win' ? '🟢' : '🔴';
-        const placedMsg = await sendToGuild(player.guild_id, {
-          content: `🤖 Auto-bet: ${displayName} bet ${emoji} **${ab.prediction.toUpperCase()}** for **${ab.amount.toLocaleString()}** 🪙`,
-          allowedMentions: { parse: [] },
-        });
-        if (placedMsg) appendActiveMatchExtraMessage(player.guild_id, player.puuid, matchId, placedMsg.id);
       }
 
       // Close betting after window expires
@@ -378,13 +566,40 @@ async function closeBetting(guildId, puuid, matchId, playerName) {
   try {
     const msg = await channel.messages.fetch(msgs.message_id);
     const updatedEmbed = EmbedBuilder.from(msg.embeds[0])
-      .setTitle('🔒 BETTING CLOSED')
+      .setTitle(`🔒 BETTING CLOSED — ${playerName}`)
       .setColor(0x95a5a6);
-    await msg.edit({ embeds: [updatedEmbed], components: [] });
-    fileLog.info('closeBetting: embed updated to BETTING CLOSED', { matchId, messageId: msgs.message_id });
+
+    // Editing an embed that references an attachment:// image is unreliable —
+    // every edit variant either orphans the attachment (renders twice) or
+    // breaks it (renders zero times). Instead, delete + re-send: a fresh send
+    // with the cached PNG replicates the original match-detected path, which
+    // renders the image cleanly. The message gets a new id, so update the DB.
+    const cachedPng = teamsPngByMatch.get(matchId);
+    const cachedUgg = uggUrlByMatch.get(matchId);
+    const payload = { embeds: [updatedEmbed] };
+    if (cachedPng) {
+      updatedEmbed.setImage('attachment://teams.png');
+      payload.files = [{ attachment: cachedPng, name: 'teams.png' }];
+    }
+    if (cachedUgg) {
+      payload.components = [
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setLabel('🔗 u.gg').setStyle(ButtonStyle.Link).setURL(cachedUgg),
+        ),
+      ];
+    }
+
+    await msg.delete().catch(() => {});
+    const newMsg = await channel.send(payload);
+    if (newMsg) {
+      setMatchMessageId(guildId, puuid, matchId, newMsg.id);
+      fileLog.info('closeBetting: re-sent BETTING CLOSED message', { matchId, oldId: msgs.message_id, newId: newMsg.id });
+    } else {
+      fileLog.warn('closeBetting: re-send returned null', { matchId });
+    }
   } catch (err) {
-    logger.warn({ err: err.message, matchId }, 'closeBetting: failed to edit match message');
-    fileLog.error('closeBetting: failed to edit match message', { matchId, messageId: msgs.message_id, err: err.message, code: err.code });
+    logger.warn({ err: err.message, matchId }, 'closeBetting: failed to refresh match message');
+    fileLog.error('closeBetting: failed to refresh match message', { matchId, messageId: msgs.message_id, err: err.message, code: err.code });
   }
 }
 
@@ -414,6 +629,8 @@ async function checkActiveMatches() {
     if (result.forbidden) {
       logger.info({ matchId: first.match_id, guildId: first.guild_id }, 'Custom game detected (403 Forbidden), cancelling match');
       markMatchCancelled(first.guild_id, first.match_id);
+      teamsPngByMatch.delete(first.match_id);
+      uggUrlByMatch.delete(first.match_id);
 
       // Refund all bets
       const refunded = cancelUnresolvedBets(first.guild_id, first.match_id);
@@ -453,6 +670,8 @@ async function checkActiveMatches() {
     if (isRemake) {
       logger.info({ matchId: first.match_id, guildId: first.guild_id, duration: result.info?.gameDuration }, 'Remake detected, cancelling match');
       markMatchCancelled(first.guild_id, first.match_id);
+      teamsPngByMatch.delete(first.match_id);
+      uggUrlByMatch.delete(first.match_id);
 
       const refunded = cancelUnresolvedBets(first.guild_id, first.match_id);
 
@@ -482,6 +701,8 @@ async function checkActiveMatches() {
     logger.info({ matchId: first.match_id, guildId: first.guild_id, players: rows.length }, 'Match ended, settling bets');
     peakLog.info('match ended, entering per-player loop', { matchId: first.match_id, guildId: first.guild_id, players: rows.length });
     markMatchFinished(first.guild_id, first.match_id);
+    teamsPngByMatch.delete(first.match_id);
+    uggUrlByMatch.delete(first.match_id);
 
     // Fetch the timeline once — reused for won-lane tracking, the wonLane
     // parlay leg, and the gold-lead chart. Failure degrades gracefully.
@@ -561,7 +782,9 @@ async function checkActiveMatches() {
 
       // Won lane — compare gold@14 vs the enemy in the same teamPosition.
       // null = couldn't determine (no timeline, no role data, no role-opponent).
-      const wonLane = timeline ? computeWonLane(timeline, result, row.puuid) : null;
+      const lane = timeline ? computeWonLane(timeline, result, row.puuid) : null;
+      const wonLane = lane ? lane.won : null;
+      const laneDiff = lane ? lane.diff : null;
       if (wonLane !== null) {
         recordLaneResult(row.guild_id, row.puuid, wonLane);
       }
@@ -572,7 +795,8 @@ async function checkActiveMatches() {
       const cs = (participant.totalMinionsKilled || 0) + (participant.neutralMinionsKilled || 0);
       const dmg = (participant.totalDamageDealtToChampions || 0).toLocaleString();
       const champName = getChampionName(participant.championId);
-      playerStatLines.push({ playerName, won, champName, k, d, a, kda, cs, dmg, puuid: row.puuid, teamId: participant.teamId, wonLane });
+      playerStatLines.push({ playerName, won, champName, championId: participant.championId, k, d, a, kda, cs, dmg, puuid: row.puuid, teamId: participant.teamId, wonLane, laneDiff });
+
     }
 
     if (playerStatLines.length === 0) continue;
@@ -594,9 +818,37 @@ async function checkActiveMatches() {
     const primaryPlayer = playerStatLines[0];
     const trackedPlayerWon = primaryPlayer.won;
 
+    // ── /predict10 progress + settlement ──────────────────────────────────
+    // For each tracked player in this match, bump every open prediction by
+    // one game (and one win if applicable). Settle when games_played hits 10.
+    const predict10Lines = [];
+    for (const psl of playerStatLines) {
+      const opens = getOpenPredict10ForPlayer(first.guild_id, psl.puuid);
+      for (const pred of opens) {
+        const newGames = pred.games_played + 1;
+        const newWins = pred.wins_so_far + (psl.won ? 1 : 0);
+        if (newGames < 10) {
+          updatePredict10Progress(pred.id, newGames, newWins);
+          continue;
+        }
+        const diff = Math.abs(pred.predicted_wins - newWins);
+        const mult = diff === 0 ? 5 : diff === 1 ? 2 : diff === 2 ? 1 : diff === 3 ? 0.5 : 0;
+        const payout = Math.floor(pred.amount * mult);
+        updatePredict10Progress(pred.id, newGames, newWins);
+        settlePredict10(pred.id, payout);
+        if (payout > 0) addCoins(first.guild_id, pred.discord_id, payout);
+        const name = await resolveDiscordName(first.guild_id, pred.discord_id);
+        const emoji = diff <= 1 ? '✅' : '❌';
+        const result = payout > 0
+          ? `won ${payout.toLocaleString()} 🪙 (${mult}×)`
+          : 'lost it all';
+        predict10Lines.push(`${emoji} ${name} · 🎯 ${psl.playerName} 10-game (predicted ${pred.predicted_wins}, got ${newWins}) → ${result}`);
+      }
+    }
+
     // ── Settle bets (once per match) ──────────────────────────────────────
     const bets = getUnresolvedBetsByMatch(first.guild_id, first.match_id);
-    const lines = [];
+    const betImgLines = [...predict10Lines];
 
     for (const bet of bets) {
       const predictedWin = bet.prediction === 'win';
@@ -609,13 +861,17 @@ async function checkActiveMatches() {
       updateUserStats(first.guild_id, bet.discord_id, correct, payout);
 
       const emoji = correct ? '✅' : '❌';
-      const resultText = correct ? `won **${payout.toLocaleString()}** 🪙` : 'lost their bet';
       let streakText = '';
       if (correct) {
         const updated = getUser(first.guild_id, bet.discord_id);
-        if (updated && updated.current_streak >= 3) streakText = ` (${updated.current_streak} streak 🔥)`;
+        if (updated && updated.current_streak >= 3) streakText = ` (${updated.current_streak}🔥)`;
       }
-      lines.push(`${emoji} <@${bet.discord_id}> bet **${bet.prediction.toUpperCase()}** (${bet.amount.toLocaleString()} 🪙) — ${resultText}${streakText}`);
+      const betName = await resolveDiscordName(first.guild_id, bet.discord_id);
+      const confSuffix = bet.discord_id === HOUSE_ID && bet.house_confidence != null
+        ? ` (${Math.round(bet.house_confidence * 100)}%)`
+        : '';
+      const resultImg = correct ? `won ${payout.toLocaleString()} 🪙` : 'lost their bet';
+      betImgLines.push(`${emoji} ${betName}${confSuffix} · ${bet.prediction.toUpperCase()} ${bet.amount.toLocaleString()} 🪙 → ${resultImg}${streakText}`);
     }
 
     const bettorIds = new Set(bets.map(b => b.discord_id));
@@ -623,7 +879,7 @@ async function checkActiveMatches() {
     // ── Parlay settlement ──────────────────────────────────────────────────
     // Parlay uses the first tracked player's stats. ALL legs must hit to win.
     const parlayLegsData = getMatchParlay(first.guild_id, first.match_id);
-    const parleyLines = [];
+    const parlayImgLines = [];
     if (parlayLegsData && parlayLegsData.length > 0) {
       const participant = result.info.participants.find(p => p.puuid === primaryPlayer.puuid);
 
@@ -654,21 +910,20 @@ async function checkActiveMatches() {
         return { leg, actualValue, overWins };
       });
 
-      // Build per-leg result summary
-      const legSummary = legResults.map((r, i) => {
-        const isYesNo = YES_NO_STATS.has(r.leg.stat);
-        if (isYesNo) {
-          const happened = r.actualValue > 0.5;
-          return `Leg ${i + 1} **${r.leg.label}**: **${happened ? 'YES' : 'NO'}**`;
-        }
-        const side = r.overWins ? 'OVER' : 'UNDER';
-        return `Leg ${i + 1} **${r.leg.label}**: ${r.actualValue} (line ${r.leg.line}) — **${side}**`;
-      }).join('\n');
-      parleyLines.push(`🎲 **Parlay Results:**\n${legSummary}`);
-
       const multiplier = Math.pow(config.parleyPayoutMultiplier, parlayLegsData.length);
       const parleyBets = getUnresolvedParleyBetsByMatch(first.guild_id, first.match_id);
       for (const pb of parleyBets) bettorIds.add(pb.discord_id);
+
+      // Only surface parlay detail in the image if someone actually took it.
+      if (parleyBets.length > 0) {
+        const legsCompact = legResults.map(r => {
+          const isYesNo = YES_NO_STATS.has(r.leg.stat);
+          if (isYesNo) return `${r.leg.label} ${r.actualValue > 0.5 ? '✓' : '✗'}`;
+          return `${r.leg.label} ${r.overWins ? 'OVER' : 'UNDER'}`;
+        }).join(' · ');
+        parlayImgLines.push(`🎲 ${parlayLegsData.length}-leg: ${legsCompact}`);
+      }
+
       for (const pb of parleyBets) {
         const predictions = JSON.parse(pb.predictions);
         // ALL legs must match — any wrong leg means a loss
@@ -690,96 +945,90 @@ async function checkActiveMatches() {
         updateUserStats(first.guild_id, pb.discord_id, allCorrect, payout);
 
         const pbEmoji = allCorrect ? '✅' : '❌';
+        const pbName = await resolveDiscordName(first.guild_id, pb.discord_id);
         const resultText = allCorrect
-          ? `won **${payout.toLocaleString()}** 🪙 (${multiplier}x)`
-          : `lost their parlay (${pb.amount.toLocaleString()} 🪙)`;
-        parleyLines.push(`${pbEmoji} <@${pb.discord_id}> — ${resultText}`);
+          ? `won ${payout.toLocaleString()} 🪙 (${multiplier}x)`
+          : `lost (${pb.amount.toLocaleString()} 🪙)`;
+        parlayImgLines.push(`${pbEmoji} ${pbName} parlay → ${resultText}`);
       }
     }
 
     // Check achievements for all bettors
-    const achLines = [];
+    const achImgLines = [];
     for (const discordId of bettorIds) {
       const newAch = checkAchievements(first.guild_id, discordId);
+      if (newAch.length === 0) continue;
+      const achName = await resolveDiscordName(first.guild_id, discordId);
       for (const ach of newAch) {
-        achLines.push(`🏆 <@${discordId}> unlocked **${ach.label}**`);
+        achImgLines.push(`🏆 ${achName} unlocked ${ach.label}`);
       }
     }
 
-    // ── Build Match Over embed ─────────────────────────────────────────────
-    const outcomeEmoji = trackedPlayerWon ? '🏆' : '💀';
-    const outcomeText = trackedPlayerWon ? 'WON' : 'LOST';
+    // ── Build Match Over recap image ───────────────────────────────────────
     const gameMins = Math.floor(result.info.gameDuration / 60);
     const gameSecs = result.info.gameDuration % 60;
     const durationStr = `${gameMins}:${String(gameSecs).padStart(2, '0')}`;
 
-    // Build stat lines for all tracked players in the match
-    const statLines = playerStatLines.map(p => {
-      const daily = getDailyRecord(first.guild_id, p.puuid);
-      const total = daily.wins + daily.losses;
-      const winRate = total > 0 ? daily.wins / total : 0;
-      const flame = winRate > 0.5 ? ' 🔥' : '';
-      const dailySuffix = ` (Today: ${daily.wins}W / ${daily.losses}L${flame})`;
-      const laneTag = p.wonLane === true ? ' · 🛣️ **Won Lane**'
-                     : p.wonLane === false ? ' · 🛣️ Lost Lane'
-                     : '';
-      return `**${p.playerName}**${dailySuffix}\n**${p.champName}** — ${p.k}/${p.d}/${p.a} (${p.kda} KDA) · ${p.cs} CS · ${p.dmg} DMG${laneTag}`;
-    });
+    if (bets.length > 0 || parlayImgLines.length > 0 || achImgLines.length > 0) {
+      const imgPlayers = playerStatLines.map(p => {
+        const daily = getDailyRecord(first.guild_id, p.puuid);
+        return {
+          name: p.playerName, championId: p.championId, champName: p.champName,
+          k: p.k, d: p.d, a: p.a, kda: p.kda, cs: p.cs, dmg: p.dmg,
+          dailyW: daily.wins, dailyL: daily.losses, wonLane: p.wonLane, laneDiff: p.laneDiff,
+        };
+      });
 
-    const playerNames = playerStatLines.map(p => `**${p.playerName}**`).join(' & ');
-    let description = `${playerNames} ${playerStatLines.length > 1 ? 'have' : 'has'} **${outcomeText}** the match! (${durationStr})\n\n` +
-      statLines.join('\n\n') + '\n\n' +
-      (lines.length > 0 ? lines.join('\n') : '_No bets were placed on this match._');
-    if (parleyLines.length > 0) {
-      description += '\n\n' + parleyLines.join('\n');
-    }
-    if (achLines.length > 0) {
-      description += '\n\n' + achLines.join('\n');
-    }
-
-    if (bets.length > 0 || parleyLines.length > 0 || achLines.length > 0) {
-      // Render gold-lead chart from the timeline fetched earlier. Failures
-      // fall through silently — embed still posts without the chart.
-      let chartFile = null;
+      // Gold-lead chart data (rendered inside the composite). Degrades silently.
+      let lead = null, objectives = [], kills = [];
       try {
         if (timeline) {
-          const lead = computeTeamGoldLead(timeline, result, primaryPlayer.puuid);
-          if (lead && lead.length > 0) {
-            const objectives = extractObjectiveEvents(timeline, result, primaryPlayer.puuid);
-            const kills = extractTrackedPlayerKills(timeline, primaryPlayer.puuid);
-            const pngBuf = await renderGoldLeadPng(lead, { objectives, kills });
-            if (pngBuf) chartFile = { attachment: pngBuf, name: 'gold-lead.png' };
+          const l = computeTeamGoldLead(timeline, result, primaryPlayer.puuid);
+          if (l && l.length > 0) {
+            lead = l;
+            objectives = extractObjectiveEvents(timeline, result, primaryPlayer.puuid);
+            kills = extractTrackedPlayerKills(timeline, primaryPlayer.puuid);
           }
         }
       } catch (err) {
-        logger.warn({ err: err.message, matchId: first.match_id }, 'Failed to render gold-lead chart');
+        logger.warn({ err: err.message, matchId: first.match_id }, 'Failed to build gold-lead data');
       }
 
-      const embed = new EmbedBuilder()
-        .setTitle(`${outcomeEmoji} Match Over!`)
-        .setDescription(description)
-        .setColor(trackedPlayerWon ? 0x2ecc71 : 0xe74c3c)
-        .setTimestamp();
-      if (chartFile) embed.setImage('attachment://gold-lead.png');
+      const matchOverPng = await renderMatchOverPng({
+        won: trackedPlayerWon,
+        durationStr,
+        players: imgPlayers,
+        getChampionInternalId,
+        bets: betImgLines,
+        parlay: parlayImgLines,
+        achievements: achImgLines,
+        lead, objectives, kills,
+      });
 
-      const sendPayload = { embeds: [embed] };
-      if (chartFile) {
-        sendPayload.files = [chartFile];
-        // Save (to disk) and Keep (re-post as standalone chat message)
-        // — both gated by saveGraphAllowedUserIds in the handlers.
-        sendPayload.components = [
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setCustomId(`save_gold_${first.match_id}`)
-              .setLabel('💾 Save')
-              .setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder()
-              .setCustomId(`keep_gold_${first.match_id}`)
-              .setLabel('📌 Keep in Chat')
-              .setStyle(ButtonStyle.Secondary)
-          ),
-        ];
+      let sendPayload;
+      if (matchOverPng) {
+        sendPayload = {
+          files: [{ attachment: matchOverPng, name: 'match-over.png' }],
+          // Keep in Chat button — gated by saveGraphAllowedUserIds in the handler.
+          components: [
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId(`keep_gold_${first.match_id}`).setLabel('📌 Keep in Chat').setStyle(ButtonStyle.Secondary),
+            ),
+          ],
+          allowedMentions: { parse: [] },
+        };
+      } else {
+        // Fallback to a minimal text embed if the image render failed.
+        const titleNames = playerStatLines.map(p => p.playerName).join(' & ');
+        sendPayload = {
+          embeds: [new EmbedBuilder()
+            .setTitle(`${trackedPlayerWon ? '🏆' : '💀'} Match Over — ${titleNames} ${trackedPlayerWon ? 'WON' : 'LOST'} (${durationStr})`)
+            .setColor(trackedPlayerWon ? 0x2ecc71 : 0xe74c3c)
+            .setDescription([...betImgLines, ...parlayImgLines, ...achImgLines].join('\n') || '_No bets were placed on this match._')
+            .setTimestamp()],
+        };
       }
+
       const matchOverMsg = await sendToGuild(first.guild_id, sendPayload);
       if (matchOverMsg) {
         for (const p of playerStatLines) {

@@ -4,7 +4,10 @@ import logger from './utils/logger.js';
 const RIOT_KEY = process.env.RIOT_API_KEY;
 
 // ── Data Dragon: champion ID → name mapping ─────────────────────────────────
-let championMap = null;
+// Two maps: display names (e.g. "Nunu & Willump") and internal IDs (e.g.
+// "Nunu") — the latter is what Data Dragon uses in image URLs.
+let championMap = null;        // numeric ID → display name
+let championInternalMap = null; // numeric ID → internal ID (image URL slug)
 
 export async function loadChampionMap() {
   if (championMap) return;
@@ -15,19 +18,28 @@ export async function loadChampionMap() {
     const champRes = await fetch(`https://ddragon.leagueoflegends.com/cdn/${latest}/data/en_US/champion.json`);
     const champData = await champRes.json();
     championMap = {};
+    championInternalMap = {};
     for (const champ of Object.values(champData.data)) {
-      championMap[parseInt(champ.key)] = champ.name;
+      const numeric = parseInt(champ.key);
+      championMap[numeric] = champ.name;
+      championInternalMap[numeric] = champ.id;
     }
     logger.info({ version: latest, count: Object.keys(championMap).length }, 'Loaded champion data from Data Dragon');
   } catch (err) {
     logger.error({ err: err.message }, 'Failed to load champion data from Data Dragon');
     championMap = {};
+    championInternalMap = {};
   }
 }
 
 export function getChampionName(championId) {
   if (!championMap) return `Champ ${championId}`;
   return championMap[championId] || `Champ ${championId}`;
+}
+
+// Internal ID used in Data Dragon asset URLs (e.g. "Nunu" not "Nunu & Willump").
+export function getChampionInternalId(championId) {
+  return championInternalMap?.[championId] || null;
 }
 
 async function riotFetch(url) {

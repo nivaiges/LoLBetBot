@@ -3,6 +3,8 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import logger from './utils/logger.js';
 import { toAbsoluteLP, rankLabel } from './utils/rankMath.js';
+import { displayName } from './utils/displayName.js';
+import { getChampionIcon } from './utils/championIcons.js';
 
 // Asset-loader for objective icons. Drop PNGs (≈18×18) in assets/objectives/
 // named after the kind in lowercase (baron.png, herald.png, grubs.png,
@@ -220,7 +222,9 @@ export function computeWonLane(timeline, matchResult, trackedPuuid) {
   const og = frame.participantFrames[String(oppId)]?.totalGold;
   if (tg == null || og == null) return null;
 
-  return tg > og;
+  // { won, diff }: diff is the tracked player's gold lead over their lane
+  // opponent at ~14 min (negative when behind).
+  return { won: tg > og, diff: tg - og };
 }
 
 const BLUE = '#5DADE2';
@@ -247,8 +251,10 @@ const TIER_BANDS = [
 ];
 
 // Discord uses gg sans / Whitney; fall back through Segoe UI (Windows) and the
-// generic stack so the chart renders in something close on any host.
-const FONT_STACK = '"gg sans", "Whitney", "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif';
+// generic stack so the chart renders in something close on any host. The
+// "Emoji" fonts are included so badge characters (👑 🥀) get a color glyph
+// when the host has Segoe UI Emoji or Noto Color Emoji installed.
+const FONT_STACK = '"gg sans", "Whitney", "Segoe UI", "Segoe UI Emoji", "Noto Color Emoji", "Apple Color Emoji", "Helvetica Neue", Helvetica, Arial, sans-serif';
 
 // Render a signed-line chart (line + zero-baseline area fill, blue ≥ 0 / red < 0)
 // as a PNG Buffer. Used by both the team-gold-lead chart and the profit chart.
@@ -263,6 +269,7 @@ async function renderSignedLineChart(series, opts = {}) {
   } = opts;
 
   try {
+    const SCALE = 2; // supersample for a crisp chart (esp. when embedded/scaled)
     const W = 520;
     const H = 200;
     const padL = 52;
@@ -272,18 +279,19 @@ async function renderSignedLineChart(series, opts = {}) {
     const plotW = W - padL - padR;
     const plotH = H - padT - padB;
 
-    const canvas = createCanvas(W, H);
+    const canvas = createCanvas(W * SCALE, H * SCALE);
     const ctx = canvas.getContext('2d');
+    ctx.scale(SCALE, SCALE); // draw in logical units; output is 2×
 
     ctx.fillStyle = BG;
     ctx.fillRect(0, 0, W, H);
 
     if (title) {
       ctx.fillStyle = TITLE;
-      ctx.font = `bold 13px ${FONT_STACK}`;
+      ctx.font = `bold 17px ${FONT_STACK}`;
       ctx.textBaseline = 'top';
       ctx.textAlign = 'left';
-      ctx.fillText(title, padL, 8);
+      ctx.fillText(title, padL, 6);
     }
 
     // Y range — pad to nice 1k bounds, always include 0.
@@ -512,8 +520,8 @@ async function renderSignedLineChart(series, opts = {}) {
       ctx.rotate(-Math.PI / 2);
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillStyle = AXIS;
-      ctx.font = `11px ${FONT_STACK}`;
+      ctx.fillStyle = TITLE; // white
+      ctx.font = `bold 14px ${FONT_STACK}`;
       ctx.fillText(yAxisLabel, 0, 0);
       ctx.restore();
     }
@@ -531,7 +539,7 @@ async function renderSignedLineChart(series, opts = {}) {
       ctx.beginPath();
       ctx.arc(px, py, 4.5, 0, Math.PI * 2);
       ctx.stroke();
-      drawCallout(ctx, px, py - 8, `+${formatK(maxVal2)} @ ${idx}${peakSuffix}`, BLUE, 'above', W, padR);
+      drawCallout(ctx, px, py - 8, `+${formatK(maxVal2)} @ ${idx}${peakSuffix}`, BLUE, 'above', W, padR, H);
     }
 
     if (minVal2 < 0) {
@@ -543,7 +551,7 @@ async function renderSignedLineChart(series, opts = {}) {
       ctx.beginPath();
       ctx.arc(px, py, 4.5, 0, Math.PI * 2);
       ctx.stroke();
-      drawCallout(ctx, px, py + 8, `${formatK(minVal2)} @ ${idx}${peakSuffix}`, RED, 'below', W, padR);
+      drawCallout(ctx, px, py + 8, `${formatK(minVal2)} @ ${idx}${peakSuffix}`, RED, 'below', W, padR, H);
     }
 
     return canvas.toBuffer('image/png');
@@ -555,8 +563,8 @@ async function renderSignedLineChart(series, opts = {}) {
 
 export function renderGoldLeadPng(lead, opts = {}) {
   return renderSignedLineChart(lead, {
-    title: opts.title || 'Team Gold Lead',
-    yAxisLabel: 'Gold Lead',
+    title: opts.title || 'Gold Graph',
+    yAxisLabel: 'Team Gold Lead',
     peakSuffix: 'm',
     objectives: opts.objectives || [],
     kills: opts.kills || [],
@@ -594,7 +602,7 @@ function formatK(v) {
 // Pill-shaped callout: white text on a solid colored rounded rectangle.
 // `anchor`: 'above' draws the pill so its bottom edge sits at y; 'below'
 // draws so its top edge sits at y.
-function drawCallout(ctx, x, y, text, color, anchor, W, padR) {
+function drawCallout(ctx, x, y, text, color, anchor, W, padR, H) {
   ctx.font = `bold 11px ${FONT_STACK}`;
   const tw = ctx.measureText(text).width;
   const padX = 6;
@@ -603,7 +611,9 @@ function drawCallout(ctx, x, y, text, color, anchor, W, padR) {
   let boxX = Math.round(x - boxW / 2);
   // Clamp horizontally to canvas
   boxX = Math.max(2, Math.min(W - padR - boxW, boxX));
-  const boxY = anchor === 'above' ? Math.round(y - boxH) : Math.round(y);
+  let boxY = anchor === 'above' ? Math.round(y - boxH) : Math.round(y);
+  // Clamp vertically so the pill never gets cut off by the canvas edge.
+  if (typeof H === 'number') boxY = Math.max(2, Math.min(H - boxH - 2, boxY));
 
   // Pill background
   ctx.fillStyle = color;
@@ -805,12 +815,12 @@ export async function renderLpPng(entries, opts = {}) {
     ctx.beginPath();
     ctx.arc(xPx(maxIdx), yPx(series[maxIdx]), 4.5, 0, Math.PI * 2);
     ctx.stroke();
-    drawCallout(ctx, xPx(maxIdx), yPx(series[maxIdx]) - 8, `${rankLabel(peak.tier, peak.rank, peak.lp)}`, BLUE, 'above', W, padR);
+    drawCallout(ctx, xPx(maxIdx), yPx(series[maxIdx]) - 8, `${rankLabel(peak.tier, peak.rank, peak.lp)}`, BLUE, 'above', W, padR, H);
 
     // Current (last) label — only if different from peak
     if (maxIdx !== series.length - 1) {
       const last = entries[series.length - 1];
-      drawCallout(ctx, xPx(series.length - 1), yPx(series[series.length - 1]) + 8, `now: ${rankLabel(last.tier, last.rank, last.lp)}`, AXIS, 'below', W, padR);
+      drawCallout(ctx, xPx(series.length - 1), yPx(series[series.length - 1]) + 8, `now: ${rankLabel(last.tier, last.rank, last.lp)}`, AXIS, 'below', W, padR, H);
     }
 
     return canvas.toBuffer('image/png');
@@ -828,4 +838,995 @@ function niceLpStep(range) {
     if (target <= c) return c;
   }
   return Math.ceil(target / 500) * 500;
+}
+
+// Distinct colors for stacked /lpc lines (up to 6 players)
+const COMPARE_COLORS = [
+  '#5DADE2', // blue
+  '#2ecc71', // green
+  '#e67e22', // orange
+  '#9b59b6', // purple
+  '#e74c3c', // red
+  '#f1c40f', // yellow
+];
+
+export function compareColor(i) {
+  return COMPARE_COLORS[i % COMPARE_COLORS.length];
+}
+
+
+// Multi-player LP overlay. `players` = [{ riotTag, entries }] where entries is
+// the lp_history rows for that player (tier/rank/lp/recorded_at). X-axis is
+// time-aligned across players so play frequency is reflected in dot density.
+export async function renderLpComparePng(players, opts = {}) {
+  if (!players?.length) return null;
+  const valid = players.filter(p => p.entries?.length);
+  if (!valid.length) return null;
+
+  const { title = 'LP Comparison' } = opts;
+
+  try {
+    const W = 520;
+    const H = 220;
+    const padL = 56;
+    const padR = 14;
+    const padT = 28;
+    const padB = 22;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB;
+
+    const canvas = createCanvas(W, H);
+    const ctx = canvas.getContext('2d');
+
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle = TITLE;
+    ctx.font = `bold 13px ${FONT_STACK}`;
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';
+    ctx.fillText(title, padL, 8);
+
+    // Y range across all players
+    let minVal = Infinity, maxVal = -Infinity;
+    for (const p of valid) {
+      for (const e of p.entries) {
+        const abs = toAbsoluteLP(e.tier, e.rank, e.lp);
+        if (abs == null) continue;
+        if (abs < minVal) minVal = abs;
+        if (abs > maxVal) maxVal = abs;
+      }
+    }
+    if (!Number.isFinite(minVal)) return null;
+    const span = Math.max(50, maxVal - minVal);
+    const pad = Math.max(25, span * 0.1);
+    let yMin = Math.max(0, Math.floor((minVal - pad) / 50) * 50);
+    const yMax = Math.ceil((maxVal + pad) / 50) * 50;
+
+    // Extend yMin to include at least half of the band below (same as /lp)
+    const playerBandIdx = TIER_BANDS.findIndex(b => minVal >= b.min && minVal < b.max);
+    if (playerBandIdx > 0) {
+      const bandBelow = TIER_BANDS[playerBandIdx - 1];
+      const targetMin = Math.max(0, bandBelow.min + Math.floor((bandBelow.max - bandBelow.min) / 2 / 50) * 50);
+      yMin = Math.min(yMin, targetMin);
+    }
+    const yRange = yMax - yMin || 1;
+    const yPx = v => padT + plotH * (yMax - v) / yRange;
+
+    // Time range (X-axis)
+    const parseTs = s => {
+      const t = Date.parse((s || '').replace(' ', 'T') + 'Z');
+      return Number.isFinite(t) ? t : null;
+    };
+    let tMin = Infinity, tMax = -Infinity;
+    for (const p of valid) {
+      for (const e of p.entries) {
+        const t = parseTs(e.recorded_at);
+        if (t == null) continue;
+        if (t < tMin) tMin = t;
+        if (t > tMax) tMax = t;
+      }
+    }
+    if (!Number.isFinite(tMin) || tMin === tMax) tMax = tMin + 1;
+    const tSpan = tMax - tMin;
+    const xPx = t => padL + plotW * (t - tMin) / tSpan;
+
+    // Tier bands
+    for (const band of TIER_BANDS) {
+      const lo = Math.max(band.min, yMin);
+      const hi = Math.min(band.max, yMax);
+      if (hi <= lo) continue;
+      const yTop = yPx(hi);
+      const yBot = yPx(lo);
+      ctx.fillStyle = band.color;
+      ctx.fillRect(padL, yTop, plotW, yBot - yTop);
+      if (yBot - yTop > 14) {
+        ctx.fillStyle = 'rgba(255,255,255,0.22)';
+        ctx.font = `9px ${FONT_STACK}`;
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'top';
+        ctx.fillText(band.name, W - padR - 3, yTop + 2);
+      }
+    }
+
+    // Tier boundary dashed lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    for (const band of TIER_BANDS) {
+      if (band.min > yMin && band.min < yMax) {
+        const py = yPx(band.min);
+        ctx.beginPath();
+        ctx.moveTo(padL, py);
+        ctx.lineTo(W - padR, py);
+        ctx.stroke();
+      }
+    }
+    ctx.setLineDash([]);
+
+    // Y-tick labels
+    const niceStep = niceLpStep(yRange);
+    ctx.fillStyle = AXIS;
+    ctx.font = `11px ${FONT_STACK}`;
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    for (let v = Math.ceil(yMin / niceStep) * niceStep; v <= yMax; v += niceStep) {
+      ctx.fillText(v.toString(), padL - 6, yPx(v));
+    }
+
+    // One line + dots per player. Lines drawn first so peak rings/callouts
+    // (drawn in a second pass below) always sit on top of every line.
+    const peakMarks = [];
+    for (let pi = 0; pi < valid.length; pi++) {
+      const p = valid[pi];
+      const color = compareColor(pi);
+      const pts = [];
+      let peak = null; // { abs, entry, point }
+      let pit = null;  // { abs, entry, point } — lowest LP reached
+      for (const e of p.entries) {
+        const abs = toAbsoluteLP(e.tier, e.rank, e.lp);
+        const t = parseTs(e.recorded_at);
+        if (abs == null || t == null) continue;
+        const pt = { x: xPx(t), y: yPx(abs) };
+        pts.push(pt);
+        if (!peak || abs > peak.abs) peak = { abs, entry: e, point: pt };
+        if (!pit || abs < pit.abs) pit = { abs, entry: e, point: pt };
+      }
+      if (pts.length === 0) continue;
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.stroke();
+
+      // Carry-forward: if this player hasn't logged a point at the global
+      // tMax, extend a faint dashed plateau from their last point to the right
+      // edge so every line ends at the same x.
+      const lastEntry = p.entries[p.entries.length - 1];
+      const lastT = parseTs(lastEntry?.recorded_at);
+      if (lastT != null && lastT < tMax) {
+        const lastPt = pts[pts.length - 1];
+        ctx.save();
+        ctx.globalAlpha = 0.45;
+        ctx.setLineDash([4, 3]);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(lastPt.x, lastPt.y);
+        ctx.lineTo(xPx(tMax), lastPt.y);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Dots only at the peak and pit (highest / lowest LP for this player).
+      ctx.fillStyle = color;
+      const dotPoints = [];
+      if (peak) dotPoints.push(peak.point);
+      if (pit && pit.point !== peak?.point) dotPoints.push(pit.point);
+      for (const pt of dotPoints) {
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      if (peak) peakMarks.push({ pi, color, peak });
+    }
+
+    // Per-player peak callouts — ring + pill with the rank label. Stagger
+    // upward by player index so two peaks at similar Y/X don't overlap.
+    for (const m of peakMarks) {
+      const { color, peak, pi } = m;
+      const { point, entry } = peak;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, 4.5, 0, Math.PI * 2);
+      ctx.stroke();
+
+      const labelY = Math.max(padT + 10, point.y - 8 - pi * 14);
+      drawCallout(ctx, point.x, labelY, rankLabel(entry.tier, entry.rank, entry.lp), color, 'above', W, padR, H);
+    }
+
+    // Y-axis label
+    ctx.save();
+    ctx.translate(14, padT + plotH / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = AXIS;
+    ctx.font = `11px ${FONT_STACK}`;
+    ctx.fillText('LP', 0, 0);
+    ctx.restore();
+
+    return canvas.toBuffer('image/png');
+  } catch (err) {
+    logger.warn({ err: err.message }, 'matchGraph: LP compare render failed');
+    return null;
+  }
+}
+
+// Solid tier-fill colors for the rank-ladder bars. Slightly different from the
+// faint band fills (TIER_BANDS above) — needs to be opaque/saturated to stand
+// out as a bar.
+const TIER_BAR_COLORS = {
+  IRON:        '#7a6a62',
+  BRONZE:      '#a0522d',
+  SILVER:      '#c0c0c0',
+  GOLD:        '#f1c40f',
+  PLATINUM:    '#3cbec8',
+  EMERALD:     '#2ecc71',
+  DIAMOND:     '#5DADE2',
+  MASTER:      '#9b59b6',
+  GRANDMASTER: '#e74c3c',
+  CHALLENGER:  '#f4d03f',
+};
+
+const PEAK_YELLOW = '#f1c40f';
+
+// Short tier abbreviations for the per-player LP tag (e.g. "c-1235", "m-345",
+// "d2-45"). Master+ have no division so it's just abbr-LP; below master we
+// include the division number (IV→4 … I→1).
+const TIER_ABBR = {
+  IRON: 'I', BRONZE: 'B', SILVER: 'S', GOLD: 'G', PLATINUM: 'P',
+  EMERALD: 'E', DIAMOND: 'D', MASTER: 'M', GRANDMASTER: 'GM', CHALLENGER: 'C',
+};
+const MASTER_PLUS_TIERS = new Set(['MASTER', 'GRANDMASTER', 'CHALLENGER']);
+const DIVISION_NUM = { I: 1, II: 2, III: 3, IV: 4 };
+
+function formatRankShort(tier, rank, lp) {
+  if (!tier) return null;
+  const abbr = TIER_ABBR[tier] || '?';
+  if (lp == null) return abbr;
+  if (MASTER_PLUS_TIERS.has(tier)) return `${abbr}-${lp}`;
+  const div = DIVISION_NUM[rank] || '';
+  return `${abbr}${div}-${lp}`;
+}
+
+// Horizontal-bar rank ladder. Each player is a row: name on the left, a
+// tier-colored bar from 0 to their current absolute LP, a faded extension +
+// vertical tick to their peak if they've lost LP, and a right-side label.
+// Players currently at peak get a yellow halo around the end-cap dot and a
+// "CURRENT PEAK!!" tag in yellow.
+//
+// `players` shape: [{ riot_tag, tier, rank, lp, peak_tier?, peak_rank?, peak_lp? }]
+export function renderRankLadderPng(players, opts = {}) {
+  if (!players?.length) return null;
+  const {
+    title = 'Tracked Players — Rank Ladder',
+    decorateFirstLast = false, // 👑 on first, 🥀 on last — only when /rank passes this
+    bg = BG, // override canvas background for one-off tests
+  } = opts;
+
+  try {
+    const sorted = [...players].sort((a, b) =>
+      (toAbsoluteLP(b.tier, b.rank, b.lp) || 0) - (toAbsoluteLP(a.tier, a.rank, a.lp) || 0)
+    );
+
+    const rowH = 40;
+    const padT = 44;
+    const padB = 32;
+    const padL = 18;
+    const padR = 18;
+    const nameW = 120;
+    const labelW = 260;
+    const W = 820;
+    const H = padT + rowH * sorted.length + padB;
+    const barX = padL + nameW;
+    const barAreaW = W - padL - padR - nameW - labelW;
+    const barH = 20;
+
+    const allAbs = sorted.flatMap(p => [
+      toAbsoluteLP(p.tier, p.rank, p.lp) || 0,
+      p.peak_tier ? (toAbsoluteLP(p.peak_tier, p.peak_rank, p.peak_lp) || 0) : 0,
+    ]);
+    const maxAbs = Math.max(...allAbs, 0);
+    const xMax = Math.max(2800, Math.ceil((maxAbs * 1.05) / 100) * 100);
+    const xPx = v => barX + barAreaW * v / xMax;
+
+    const canvas = createCanvas(W, H);
+    const ctx = canvas.getContext('2d');
+
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle = TITLE;
+    ctx.font = `bold 16px ${FONT_STACK}`;
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';
+    ctx.fillText(title, padL, 12);
+
+    // Tier band backgrounds (vertical zones across all rows)
+    const bandTop = padT - 2;
+    const bandBot = H - padB + 2;
+    for (const band of TIER_BANDS) {
+      const xLo = xPx(Math.max(0, band.min));
+      const xHi = xPx(Math.min(xMax, band.max));
+      if (xHi <= xLo) continue;
+      ctx.fillStyle = band.color;
+      ctx.fillRect(xLo, bandTop, xHi - xLo, bandBot - bandTop);
+    }
+
+    // Tier boundary dashed lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    for (const band of TIER_BANDS) {
+      if (band.min > 0 && band.min <= xMax) {
+        const x = xPx(band.min);
+        ctx.beginPath();
+        ctx.moveTo(x, bandTop);
+        ctx.lineTo(x, bandBot);
+        ctx.stroke();
+      }
+    }
+    ctx.setLineDash([]);
+
+    for (let i = 0; i < sorted.length; i++) {
+      const p = sorted[i];
+      const rowCenter = padT + rowH * i + rowH / 2;
+      const absCur = toAbsoluteLP(p.tier, p.rank, p.lp) || 0;
+      const absPeak = p.peak_tier ? (toAbsoluteLP(p.peak_tier, p.peak_rank, p.peak_lp) || 0) : 0;
+      const color = TIER_BAR_COLORS[p.tier] || '#999';
+      const peakColor = TIER_BAR_COLORS[p.peak_tier] || color;
+      const isPeaking = !p.peak_tier || absCur >= absPeak;
+
+      // Player name — last place gets a 🥀 prefix when decorateFirstLast
+      let namePrefix = '';
+      if (decorateFirstLast && sorted.length > 1 && i === sorted.length - 1) {
+        namePrefix = '🥀 ';
+      }
+      ctx.fillStyle = '#fff';
+      ctx.font = `bold 15px ${FONT_STACK}`;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(namePrefix + displayName(p.riot_tag), padL, rowCenter);
+
+      // Background bar
+      ctx.fillStyle = 'rgba(255,255,255,0.04)';
+      ctx.fillRect(barX, rowCenter - barH / 2, barAreaW, barH);
+
+      // Peak extension (drawn first so current overlays it)
+      if (absPeak > absCur) {
+        const peakX = xPx(absPeak);
+        const curX = xPx(absCur);
+        ctx.fillStyle = peakColor + '40';
+        ctx.fillRect(curX, rowCenter - barH / 2, peakX - curX, barH);
+      }
+
+      // Solid current bar
+      const fillW = Math.max(2, xPx(absCur) - barX);
+      ctx.fillStyle = color;
+      ctx.fillRect(barX, rowCenter - barH / 2, fillW, barH);
+
+      // End-cap dot with optional yellow halo
+      const capX = barX + fillW;
+      if (isPeaking) {
+        ctx.fillStyle = PEAK_YELLOW;
+        ctx.beginPath();
+        ctx.arc(capX, rowCenter, barH / 2 + 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(capX, rowCenter, barH / 2 + 1, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Peak tick marker
+      if (absPeak > absCur) {
+        const peakX = xPx(absPeak);
+        ctx.strokeStyle = peakColor;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(peakX, rowCenter - barH / 2 - 3);
+        ctx.lineTo(peakX, rowCenter + barH / 2 + 3);
+        ctx.stroke();
+      }
+
+      // Right-side label
+      const labelX = W - padR - labelW + 4;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+
+      const curLabel = rankLabel(p.tier, p.rank, p.lp);
+      ctx.fillStyle = isPeaking ? PEAK_YELLOW : '#fff';
+      ctx.font = `bold 14px ${FONT_STACK}`;
+      ctx.fillText(curLabel, labelX, rowCenter);
+      const curW = ctx.measureText(curLabel).width;
+
+      if (isPeaking) {
+        ctx.fillStyle = PEAK_YELLOW;
+        ctx.font = `bold 13px ${FONT_STACK}`;
+        ctx.fillText('  ·  CURRENT PEAK!!', labelX + curW, rowCenter);
+      } else if (p.peak_tier) {
+        ctx.fillStyle = AXIS;
+        ctx.font = `13px ${FONT_STACK}`;
+        ctx.fillText(`  ·  peak: ${rankLabel(p.peak_tier, p.peak_rank, p.peak_lp)}`, labelX + curW, rowCenter);
+      }
+    }
+
+    // Tier labels along the bottom
+    ctx.fillStyle = AXIS;
+    ctx.font = `11px ${FONT_STACK}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    for (const band of TIER_BANDS) {
+      const mid = (band.min + Math.min(band.max, xMax)) / 2;
+      if (mid > xMax) continue;
+      ctx.fillText(band.name, xPx(mid), H - padB + 6);
+    }
+
+    return canvas.toBuffer('image/png');
+  } catch (err) {
+    logger.warn({ err: err.message }, 'matchGraph: rank ladder render failed');
+    return null;
+  }
+}
+
+// Lane-aligned team composite for Match Detected — two rows of 5 champion
+// icons (blue team top, red team bottom) with a "VS" divider between, and
+// the tracked player's icon outlined in yellow.
+//
+// Expects `blueTeam` and `redTeam` already ordered TOP → JUNGLE → MID → BOT → SUP.
+export async function renderTeamsCompositePng(opts = {}) {
+  const {
+    blueTeam = [],
+    redTeam = [],
+    trackedPuuid = null,
+    getChampionInternalId, // (championId) => internal-id string (Data Dragon URL slug)
+    getChampionName,       // (championId) => display name
+    getLabel,              // optional (participant) => label string; defaults to champion name
+    title = null,          // header title (e.g. 'MATCH DETECTED')
+    subtitle = null,       // header subtitle (e.g. 'Nivy on Pyke')
+    side = null,           // 'Blue' | 'Red'
+    sideColor = '#5DADE2', // CSS hex for the accent strip + side pill
+    avgRank = null,        // plain text (no Discord custom emoji)
+    gameMode = null,       // queue/game-mode name shown in the corner pill
+    autoBets = [],         // array of already-resolved plain strings
+    parlay = null,         // { label, legs } — rendered as a card above auto-bets
+    blueBans = [],         // array of champion IDs banned by blue team (in pick order)
+    redBans = [],          // array of champion IDs banned by red team
+    teamLabels = false,    // change 1: BLUE/RED header per team (no side pill, no VS)
+    autoBetStyle = 'plain',// 'plain' | 'card' (change 2: separated auto-bet card)
+  } = opts;
+
+  if (!blueTeam.length || !redTeam.length || !getChampionInternalId || !getChampionName) return null;
+
+  const labelFor = (p) => (getLabel ? getLabel(p) : getChampionName(p.championId)) || getChampionName(p.championId) || '?';
+
+  try {
+    const SCALE = 2;                       // supersample for a crisp hi-res PNG
+    const iconSize = 84;                   // champion icon diameter
+    const iconR = iconSize / 2;
+    const ringW = 3;                       // tier-colored outline thickness
+    const lpBubbleH = 20;                  // LP pill height
+    const lpBubbleTopRel = iconSize + 24;  // LP pill top, relative to row's top
+    const labelH = 46;                     // room for name + LP bubble (two lines)
+    const cellH = iconSize + 5 + labelH;
+    const gap = 14;
+    const padX = 18;
+    const padY = 18;
+    const vsBandH = 30;
+    const hasHeader = !!(title || subtitle || side || avgRank || gameMode);
+    const headerH = hasHeader ? 52 : padY;
+
+    // Team row layout. With `teamLabels`, each team gets a BLUE/RED header and
+    // the VS pill is dropped; otherwise the original VS-divider layout is used.
+    const teamLabelH = teamLabels ? 24 : 0;
+    const sepGap = 8;
+    const blueRowY = headerH + teamLabelH;
+    const redRowY = teamLabels
+      ? blueRowY + cellH + sepGap + teamLabelH
+      : headerH + cellH + vsBandH;
+    const gridBottom = redRowY + cellH;
+
+    // Footer cards (parlay, auto-bets). Each card: header row + N lines + pad.
+    const cardGap = 10;
+    const cardHeightFor = (n) => 24 + n * 22 + 12;
+    const parlaySectionH = parlay ? (cardGap + cardHeightFor(1)) : 0;
+    let autoSectionH = 0;
+    if (autoBets.length) {
+      autoSectionH = autoBetStyle === 'card'
+        ? cardGap + cardHeightFor(autoBets.length)
+        : 20 + autoBets.length * 22 + 6;
+    }
+
+    const W = padX * 2 + iconSize * 5 + gap * 4;
+    const H = gridBottom + parlaySectionH + autoSectionH + 14;
+
+    const canvas = createCanvas(W * SCALE, H * SCALE);
+    const ctx = canvas.getContext('2d');
+    ctx.scale(SCALE, SCALE);               // draw in logical units; output is 2×
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    // Header: accent strip + title/subtitle (left) + side · avg-rank pill (right)
+    if (hasHeader) {
+      ctx.fillStyle = sideColor;
+      ctx.fillRect(0, 0, W, 4);
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      if (title) {
+        ctx.fillStyle = '#fff';
+        ctx.font = `800 22px ${FONT_STACK}`;
+        ctx.fillText(title, padX, subtitle ? 28 : 34);
+      }
+      if (subtitle) {
+        ctx.fillStyle = '#b5bac1';
+        ctx.font = `13px ${FONT_STACK}`;
+        ctx.fillText(subtitle, padX, 45);
+      }
+      // Corner pill: with team labels it shows the game mode (neutral); without,
+      // it shows side · avg rank in the side color.
+      const pillText = teamLabels
+        ? (gameMode || null)
+        : [side ? `${side.toUpperCase()} SIDE` : null, avgRank].filter(Boolean).join(' · ') || null;
+      if (pillText) {
+        ctx.font = `bold 13px ${FONT_STACK}`;
+        const ptw = ctx.measureText(pillText).width;
+        const pW = ptw + 22;
+        const pH = 26;
+        const pXr = W - padX - pW;
+        const pYr = 13;
+        ctx.fillStyle = teamLabels ? '#4e5058' : sideColor;
+        roundRect(ctx, pXr, pYr, pW, pH, pH / 2);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(pillText, pXr + pW / 2, pYr + pH / 2 + 1);
+      }
+    }
+
+    async function drawRow(team, rowY) {
+      for (let i = 0; i < team.length; i++) {
+        const p = team[i];
+        const cx = padX + i * (iconSize + gap) + iconR;
+        const cy = rowY + iconR;
+        const internalId = getChampionInternalId(p.championId);
+        const isTracked = p.puuid === trackedPuuid;
+
+        const icon = internalId ? await getChampionIcon(internalId) : null;
+
+        // Champion icon clipped to a circle
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(cx, cy, iconR, 0, Math.PI * 2);
+        ctx.clip();
+        if (icon) {
+          ctx.drawImage(icon, cx - iconR, cy - iconR, iconSize, iconSize);
+        } else {
+          ctx.fillStyle = 'rgba(255,255,255,0.05)';
+          ctx.fillRect(cx - iconR, cy - iconR, iconSize, iconSize);
+          ctx.fillStyle = '#aab';
+          ctx.font = `bold 11px ${FONT_STACK}`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          const name = getChampionName(p.championId) || '?';
+          ctx.fillText(name.slice(0, 6), cx, cy);
+        }
+        ctx.restore();
+
+        // Outline ring always shows the player's tier color (unranked → grey),
+        // so the tracked player still reads as their actual rank.
+        ctx.strokeStyle = TIER_BAR_COLORS[p.tier] || '#888';
+        ctx.lineWidth = ringW;
+        ctx.beginPath();
+        ctx.arc(cx, cy, iconR - ringW / 2, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // Label (summoner name when known, else champion name). The tracked
+        // player is highlighted with a yellow italic name.
+        const display = labelFor(p);
+        const short = display.length > 12 ? display.slice(0, 11) + '…' : display;
+        const nameY = rowY + iconSize + 6;
+        ctx.fillStyle = isTracked ? PEAK_YELLOW : '#fff';
+        ctx.font = `${isTracked ? 'italic ' : ''}bold 13px ${FONT_STACK}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillText(short, cx, nameY);
+
+        // LP bubble under the name: tier-colored pill with white text so it pops.
+        const lpTag = formatRankShort(p.tier, p.rank, p.lp);
+        if (lpTag) {
+          ctx.font = `bold 13px ${FONT_STACK}`;
+          const tw = ctx.measureText(lpTag).width;
+          const bw = tw + 16;
+          const bh = lpBubbleH;
+          const bx = cx - bw / 2;
+          const byy = rowY + lpBubbleTopRel;
+          ctx.fillStyle = TIER_BAR_COLORS[p.tier] || '#555';
+          roundRect(ctx, bx, byy, bw, bh, bh / 2);
+          ctx.fill();
+          ctx.fillStyle = '#fff';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(lpTag, cx, byy + bh / 2 + 0.5);
+        }
+      }
+    }
+
+    // Change 1: per-team BLUE/RED labels with a divider line to the right.
+    // When bans are present, render 5 dimmed champion icons with a red slash
+    // on the right side of the label row.
+    const drawTeamLabel = async (text, color, labelTopY, bans = []) => {
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.font = `800 14px ${FONT_STACK}`;
+      ctx.fillStyle = color;
+      ctx.fillText(text, padX, labelTopY + 14);
+      const tw = ctx.measureText(text).width;
+
+      // Reserve space on the right for up to 5 ban icons.
+      const banSize = 22;
+      const banGap = 4;
+      const banCount = Math.min(bans.length, 5);
+      const bansW = banCount > 0 ? (banCount * (banSize + banGap) - banGap) : 0;
+      const bansX = W - padX - bansW;
+      const lineEndX = banCount > 0 ? bansX - 10 : (W - padX);
+
+      ctx.save();
+      ctx.globalAlpha = 0.45;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(padX + tw + 10, labelTopY + 9);
+      ctx.lineTo(lineEndX, labelTopY + 9);
+      ctx.stroke();
+      ctx.restore();
+
+      for (let i = 0; i < banCount; i++) {
+        const champId = bans[i];
+        const bx = bansX + i * (banSize + banGap);
+        const by = labelTopY + 9 - banSize / 2;
+
+        // Background tile (in case the icon doesn't load or champ wasn't banned)
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(bx, by, banSize, banSize);
+
+        if (champId != null && champId !== -1) {
+          const internalId = getChampionInternalId(champId);
+          const icon = internalId ? await getChampionIcon(internalId) : null;
+          if (icon) {
+            ctx.save();
+            ctx.globalAlpha = 0.55; // dim banned icons
+            ctx.drawImage(icon, bx, by, banSize, banSize);
+            ctx.restore();
+          }
+        }
+
+        // Red diagonal slash to mark "banned"
+        ctx.strokeStyle = '#e74c3c';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(bx + 2, by + banSize - 2);
+        ctx.lineTo(bx + banSize - 2, by + 2);
+        ctx.stroke();
+      }
+    };
+
+    if (teamLabels) {
+      await drawTeamLabel('BLUE', '#5DADE2', headerH, blueBans);
+      await drawTeamLabel('RED', '#e74c3c', redRowY - teamLabelH, redBans);
+    }
+
+    await drawRow(blueTeam, blueRowY);
+    await drawRow(redTeam, redRowY);
+
+    // Original VS divider + pill (only when team labels are off).
+    if (!teamLabels) {
+      const vsCenterX = W / 2;
+      const row1BubbleBottom = headerH + lpBubbleTopRel + lpBubbleH;
+      const row2IconTop = headerH + cellH + vsBandH;
+      const vsCenterY = (row1BubbleBottom + row2IconTop) / 2;
+
+      ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padX, vsCenterY);
+      ctx.lineTo(W - padX, vsCenterY);
+      ctx.stroke();
+
+      ctx.font = `bold 14px ${FONT_STACK}`;
+      const vsText = 'VS';
+      const tw = ctx.measureText(vsText).width;
+      const pillW = tw + 18;
+      const pillH = 22;
+
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      roundRect(ctx, vsCenterX - pillW / 2 - 1, vsCenterY - pillH / 2 + 1, pillW + 2, pillH + 2, pillH / 2 + 1);
+      ctx.fill();
+      ctx.fillStyle = '#e74c3c';
+      roundRect(ctx, vsCenterX - pillW / 2, vsCenterY - pillH / 2, pillW, pillH, pillH / 2);
+      ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(vsText, vsCenterX, vsCenterY + 1);
+    }
+
+    // Footer cards below the grid. A card = dark rounded rect + gold accent bar
+    // + bold header + one or more white lines. `lineFont` lets the parlay legs
+    // use a smaller font so a long leg list still fits.
+    const drawCard = (cardY, headerText, lines, accent = '#f0b232', lineFont = `14px ${FONT_STACK}`) => {
+      const cardH2 = cardHeightFor(lines.length);
+      ctx.fillStyle = '#1e1f22';
+      roundRect(ctx, padX, cardY, W - padX * 2, cardH2, 10);
+      ctx.fill();
+      ctx.fillStyle = accent;
+      roundRect(ctx, padX, cardY, 4, cardH2, 2);
+      ctx.fill();
+      const innerX = padX + 16;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = accent;
+      ctx.font = `bold 11px ${FONT_STACK}`;
+      ctx.fillText(headerText, innerX, cardY + 16);
+      let ly = cardY + 24;
+      ctx.font = lineFont;
+      for (const line of lines) {
+        ctx.fillStyle = '#fff';
+        ctx.fillText(line, innerX, ly + 14);
+        ly += 22;
+      }
+      return cardH2;
+    };
+
+    let fy = gridBottom;
+
+    if (parlay) {
+      fy += cardGap;
+      drawCard(fy, parlay.label, [parlay.legs], '#a974ff', `13px ${FONT_STACK}`);
+      fy += cardHeightFor(1);
+    }
+
+    if (autoBets.length) {
+      if (autoBetStyle === 'card') {
+        fy += cardGap;
+        drawCard(fy, 'AUTO-BETS 🤖', autoBets);
+        fy += cardHeightFor(autoBets.length);
+      } else {
+        let ay = fy + 4;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'alphabetic';
+        ctx.fillStyle = '#80848e';
+        ctx.font = `bold 11px ${FONT_STACK}`;
+        ctx.fillText('AUTO-BETS 🤖', padX, ay + 11);
+        ay += 20;
+        ctx.font = `14px ${FONT_STACK}`;
+        for (const line of autoBets) {
+          ctx.fillStyle = '#fff';
+          ctx.fillText(line, padX, ay + 14);
+          ay += 22;
+        }
+      }
+    }
+
+    return canvas.toBuffer('image/png');
+  } catch (err) {
+    logger.warn({ err: err.message }, 'matchGraph: teams composite render failed');
+    return null;
+  }
+}
+
+// Full Match Over recap as a single image: header + per-player cards + bets /
+// parlay / achievements sections + the gold-lead chart embedded at the bottom.
+// All text is rendered (no Discord markdown / mentions), so callers must pass
+// already-resolved display names in the bet/parlay/achievement line arrays.
+//
+// opts shape:
+//   { won, durationStr,
+//     players: [{ name, championId, champName, k, d, a, kda, cs, dmg, dailyW, dailyL, wonLane }],
+//     getChampionInternalId,
+//     bets: [string], parlay: [string], achievements: [string],
+//     lead, objectives, kills }
+export async function renderMatchOverPng(opts = {}) {
+  const {
+    won = false,
+    durationStr = '',
+    players = [],
+    getChampionInternalId,
+    bets = [],
+    parlay = [],
+    achievements = [],
+    lead = null,
+    objectives = [],
+    kills = [],
+  } = opts;
+
+  if (!players.length) return null;
+
+  const CARD = '#1e1f22';
+  const WHITE = '#ffffff';
+  const GREY = '#b5bac1';
+  const SUBTLE = '#80848e';
+  const WIN = '#3ba55d';
+  const LOSE = '#ed4245';
+  const accent = won ? WIN : LOSE;
+
+  try {
+    const SCALE = 2;
+    const W = 560;
+    const padX = 20;
+
+    // Pre-render the gold chart so we know its drawn height.
+    let goldImg = null;
+    if (lead && lead.length > 0) {
+      try {
+        const buf = await renderGoldLeadPng(lead, { objectives, kills });
+        if (buf) goldImg = await loadImage(buf);
+      } catch (err) {
+        logger.warn({ err: err.message }, 'matchGraph: gold chart render failed inside match-over');
+      }
+    }
+    const chartW = W - padX * 2;
+    const chartH = goldImg ? Math.round(goldImg.height * (chartW / goldImg.width)) : 0;
+
+    const headerH = 58;
+    const cardH = 78;
+    const cardsH = players.length * cardH + (players.length - 1) * 8;
+    const sectionGap = 16;
+    const betsH = bets.length ? (24 + bets.length * 24 + sectionGap) : 0;
+    const parlayH = parlay.length ? (24 + parlay.length * 24 + sectionGap) : 0;
+    const achH = achievements.length ? (24 + achievements.length * 24 + sectionGap) : 0;
+    const chartBlockH = goldImg ? chartH + 12 : 0;
+    const padBottom = 16;
+    const H = headerH + 10 + cardsH + sectionGap + betsH + parlayH + achH + chartBlockH + padBottom;
+
+    const canvas = createCanvas(W * SCALE, H * SCALE);
+    const ctx = canvas.getContext('2d');
+    ctx.scale(SCALE, SCALE);
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    // Header — accent top strip + "MATCH OVER" title (left) + VICTORY/DEFEAT
+    // pill (right).
+    ctx.fillStyle = accent;
+    ctx.fillRect(0, 0, W, 4);
+
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = WHITE;
+    ctx.font = `800 30px ${FONT_STACK}`;
+    ctx.fillText('MATCH OVER', padX, 42);
+
+    ctx.font = `bold 15px ${FONT_STACK}`;
+    const pillText = `${won ? 'VICTORY' : 'DEFEAT'} · ${durationStr}`;
+    const ptw = ctx.measureText(pillText).width;
+    const pillW = ptw + 24;
+    const pillH = 30;
+    const pillX = W - padX - pillW;
+    const pillY = 16;
+    ctx.fillStyle = accent;
+    roundRect(ctx, pillX, pillY, pillW, pillH, pillH / 2);
+    ctx.fill();
+    ctx.fillStyle = WHITE;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(pillText, pillX + pillW / 2, pillY + pillH / 2 + 1);
+
+    let y = headerH + 10;
+
+    for (const p of players) {
+      ctx.fillStyle = CARD;
+      roundRect(ctx, padX, y, W - padX * 2, cardH, 12);
+      ctx.fill();
+
+      const iconR = 28;
+      const icx = padX + 18 + iconR;
+      const icy = y + cardH / 2;
+      const internalId = getChampionInternalId ? getChampionInternalId(p.championId) : null;
+      const icon = internalId ? await getChampionIcon(internalId) : null;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(icx, icy, iconR, 0, Math.PI * 2);
+      ctx.clip();
+      if (icon) ctx.drawImage(icon, icx - iconR, icy - iconR, iconR * 2, iconR * 2);
+      ctx.restore();
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(icx, icy, iconR - 1.5, 0, Math.PI * 2);
+      ctx.stroke();
+
+      const tx = icx + iconR + 16;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = WHITE;
+      ctx.font = `bold 18px ${FONT_STACK}`;
+      ctx.fillText(p.name, tx, y + 28);
+
+      ctx.fillStyle = GREY;
+      ctx.font = `13px ${FONT_STACK}`;
+      ctx.fillText(p.champName, tx, y + 46);
+
+      ctx.fillStyle = WHITE;
+      ctx.font = `bold 14px ${FONT_STACK}`;
+      const kdaStr = `${p.k}/${p.d}/${p.a}`;
+      ctx.fillText(kdaStr, tx, y + 66);
+      const kw = ctx.measureText(kdaStr).width;
+      ctx.fillStyle = GREY;
+      ctx.font = `13px ${FONT_STACK}`;
+      ctx.fillText(`  ${p.kda} KDA · ${p.cs} CS · ${p.dmg} DMG`, tx + kw, y + 66);
+
+      // Right side: daily record + lane tag
+      ctx.textAlign = 'right';
+      const rx = W - padX - 16;
+      const total = p.dailyW + p.dailyL;
+      const flame = total > 0 && p.dailyW / total > 0.5 ? ' 🔥' : '';
+      ctx.fillStyle = GREY;
+      ctx.font = `bold 13px ${FONT_STACK}`;
+      ctx.fillText(`Today: ${p.dailyW}W ${p.dailyL}L${flame}`, rx, y + 30);
+      ctx.font = `12px ${FONT_STACK}`;
+      const laneMargin = (typeof p.laneDiff === 'number')
+        ? (() => { const ab = Math.abs(p.laneDiff); const s = p.laneDiff >= 0 ? '+' : '-'; return ` (${s}${ab >= 1000 ? (ab / 1000).toFixed(1) + 'k' : ab})`; })()
+        : '';
+      if (p.wonLane === true) {
+        ctx.fillStyle = WIN;
+        ctx.fillText(`✅ Won Lane${laneMargin}`, rx, y + 50);
+      } else if (p.wonLane === false) {
+        ctx.fillStyle = LOSE;
+        ctx.fillText(`❌ Lost Lane${laneMargin}`, rx, y + 50);
+      }
+
+      y += cardH + 8;
+    }
+
+    y += sectionGap - 8;
+
+    const drawSection = (label, rows) => {
+      if (!rows.length) return;
+      ctx.textAlign = 'left';
+      ctx.fillStyle = SUBTLE;
+      ctx.font = `bold 12px ${FONT_STACK}`;
+      ctx.fillText(label.toUpperCase(), padX, y + 13);
+      y += 24;
+      ctx.font = `15px ${FONT_STACK}`;
+      for (const r of rows) {
+        ctx.fillStyle = WHITE;
+        ctx.fillText(r, padX, y + 15);
+        y += 24;
+      }
+      y += sectionGap;
+    };
+
+    drawSection('Bets Settled', bets);
+    drawSection('Parlay', parlay);
+    drawSection('Achievements', achievements);
+
+    if (goldImg) {
+      ctx.save();
+      roundRect(ctx, padX, y, chartW, chartH, 10);
+      ctx.clip();
+      ctx.drawImage(goldImg, padX, y, chartW, chartH);
+      ctx.restore();
+    }
+
+    return canvas.toBuffer('image/png');
+  } catch (err) {
+    logger.warn({ err: err.message }, 'matchGraph: match-over render failed');
+    return null;
+  }
 }

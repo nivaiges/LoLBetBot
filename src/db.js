@@ -298,6 +298,26 @@ function migrate() {
       recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_lp_history_puuid ON lp_history(guild_id, puuid, id);
+
+    -- "Predict next 10 wins" bets. Each row tracks one bettor's prediction for
+    -- one tracked player; games_played counts up as the bot settles matches
+    -- (any queue), and the bet settles when games_played reaches 10.
+    CREATE TABLE IF NOT EXISTS predict10_bets (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id        TEXT NOT NULL,
+      discord_id      TEXT NOT NULL,
+      target_puuid    TEXT NOT NULL,
+      predicted_wins  INTEGER NOT NULL,
+      amount          INTEGER NOT NULL,
+      games_played    INTEGER NOT NULL DEFAULT 0,
+      wins_so_far     INTEGER NOT NULL DEFAULT 0,
+      state           TEXT NOT NULL DEFAULT 'open',
+      payout          INTEGER,
+      created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      settled_at      TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_predict10_open ON predict10_bets(guild_id, target_puuid, state);
+    CREATE INDEX IF NOT EXISTS idx_predict10_user ON predict10_bets(guild_id, discord_id, state);
   `);
 }
 
@@ -427,11 +447,11 @@ export function touchMatch(id) {
 }
 
 // Bets
-export function placeBet(guildId, discordId, matchId, puuid, prediction, amount) {
+export function placeBet(guildId, discordId, matchId, puuid, prediction, amount, houseConfidence = null) {
   return db.prepare(`
-    INSERT INTO bets (guild_id, discord_id, match_id, puuid, prediction, amount)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(guildId, discordId, matchId, puuid, prediction, amount);
+    INSERT INTO bets (guild_id, discord_id, match_id, puuid, prediction, amount, house_confidence)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(guildId, discordId, matchId, puuid, prediction, amount, houseConfidence);
 }
 
 export function getUserBetOnMatch(guildId, discordId, matchId) {
@@ -947,6 +967,58 @@ export function getDuoPairs(guildId) {
 export function resetDuoPair(guildId, puuidA, puuidB) {
   const [p1, p2] = puuidA < puuidB ? [puuidA, puuidB] : [puuidB, puuidA];
   return db.prepare('UPDATE duo_pairs SET wins = 0, losses = 0 WHERE guild_id = ? AND puuid1 = ? AND puuid2 = ?').run(guildId, p1, p2);
+}
+
+// Nullable house_confidence column on bets — only set when "The House" places
+// the bet, so we can surface its model confidence in the Match Over recap.
+try { db.exec('ALTER TABLE bets ADD COLUMN house_confidence REAL'); } catch { /* exists */ }
+
+
+// ── /predict10 helpers ────────────────────────────────────────────────────────
+
+export function createPredict10(guildId, discordId, targetPuuid, predictedWins, amount) {
+  return db.prepare(`
+    INSERT INTO predict10_bets (guild_id, discord_id, target_puuid, predicted_wins, amount)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(guildId, discordId, targetPuuid, predictedWins, amount);
+}
+
+export function getOpenPredict10ForPlayer(guildId, targetPuuid) {
+  return db.prepare(`
+    SELECT * FROM predict10_bets
+    WHERE guild_id = ? AND target_puuid = ? AND state = 'open'
+  `).all(guildId, targetPuuid);
+}
+
+export function getOpenPredict10ForUser(guildId, discordId) {
+  return db.prepare(`
+    SELECT * FROM predict10_bets
+    WHERE guild_id = ? AND discord_id = ? AND state = 'open'
+    ORDER BY id DESC
+  `).all(guildId, discordId);
+}
+
+// Look up a user's open prediction on a specific player (used for "one open
+// slot per user × player" enforcement).
+export function getOpenPredict10ForUserAndPlayer(guildId, discordId, targetPuuid) {
+  return db.prepare(`
+    SELECT * FROM predict10_bets
+    WHERE guild_id = ? AND discord_id = ? AND target_puuid = ? AND state = 'open'
+  `).get(guildId, discordId, targetPuuid);
+}
+
+export function updatePredict10Progress(id, gamesPlayed, winsSoFar) {
+  return db.prepare(`
+    UPDATE predict10_bets SET games_played = ?, wins_so_far = ? WHERE id = ?
+  `).run(gamesPlayed, winsSoFar, id);
+}
+
+export function settlePredict10(id, payout) {
+  return db.prepare(`
+    UPDATE predict10_bets
+    SET state = 'settled', payout = ?, settled_at = datetime('now')
+    WHERE id = ?
+  `).run(payout, id);
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────
