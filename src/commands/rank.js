@@ -1,8 +1,9 @@
-import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
-import { getRankedStatsByPuuid } from '../riot.js';
-import { getTrackedPlayers, updatePeakRank, recordLp } from '../db.js';
+import { SlashCommandBuilder } from 'discord.js';
+import { getRankedStatsByPuuid, getSummonerByPuuid, getApexCutoffs, getRiotCooldown, riotRateLimitMessage } from '../riot.js';
+import { getTrackedPlayers, updatePeakRank, recordLp, getEarliestLpSince } from '../db.js';
 import { displayName } from '../utils/displayName.js';
 import { renderRankLadderPng } from '../matchGraph.js';
+import { toAbsoluteLP } from '../utils/rankMath.js';
 
 const TIERS_ASC = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'MASTER', 'GRANDMASTER', 'CHALLENGER'];
 const DIVS = ['IV', 'III', 'II', 'I'];
@@ -26,6 +27,12 @@ export async function execute(interaction) {
     return interaction.reply({ content: 'No tracked players. Use `/adduser` to add some.', ephemeral: true });
   }
 
+  // Pre-flight: bail with a clear message instead of starting work the
+  // shared cooldown would only abort partway through.
+  if (getRiotCooldown().cooling) {
+    return interaction.reply({ content: riotRateLimitMessage(), ephemeral: true });
+  }
+
   await interaction.deferReply();
 
   const ranked = [];
@@ -34,7 +41,7 @@ export async function execute(interaction) {
   for (const player of players) {
     const entries = await getRankedStatsByPuuid(player.puuid, player.region);
     if (entries?.rateLimited) {
-      return interaction.editReply({ content: '⏳ Riot API is rate-limiting us right now. Try again in a few seconds.' });
+      return interaction.editReply({ content: riotRateLimitMessage() });
     }
     if (!entries) {
       unranked.push(player);
@@ -53,13 +60,47 @@ export async function execute(interaction) {
       recordLp(guildId, player.puuid, solo.tier, solo.rank, solo.leaguePoints, null);
     }
 
+    // Profile icon — best-effort; the renderer falls back to a neutral tile.
+    const summoner = await getSummonerByPuuid(player.puuid, player.region);
+    const profileIconId = summoner?.profileIconId ?? null;
+
+    // Weekly LP delta — compare the earliest lp_history entry from the last
+    // 7 days against the current LP. null if no baseline exists yet.
+    const sinceIso = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+      .toISOString().slice(0, 19).replace('T', ' ');
+    const baseline = getEarliestLpSince(guildId, player.puuid, sinceIso);
+    let weeklyDelta = null;
+    if (baseline) {
+      const before = toAbsoluteLP(baseline.tier, baseline.rank, baseline.lp);
+      const now = toAbsoluteLP(solo.tier, solo.rank, solo.leaguePoints);
+      if (Number.isFinite(before) && Number.isFinite(now)) weeklyDelta = now - before;
+    }
+
     ranked.push({
       puuid: player.puuid,
       riot_tag: player.riot_tag,
+      region: player.region,
       tier: solo.tier,
       rank: solo.rank,
       lp: solo.leaguePoints,
+      profileIconId,
+      weeklyDelta,
     });
+  }
+
+  // Fetch live apex-tier cutoffs once per region (Master→GM and GM→Challenger
+  // LP thresholds). getApexCutoffs caches for ~1h, so this is effectively free
+  // on repeat /rank calls.
+  const apexRegions = [...new Set(ranked
+    .filter(r => ['MASTER', 'GRANDMASTER', 'CHALLENGER'].includes(r.tier))
+    .map(r => r.region)
+  )];
+  const cutoffsByRegion = {};
+  await Promise.all(apexRegions.map(async (region) => {
+    cutoffsByRegion[region] = await getApexCutoffs(region);
+  }));
+  for (const r of ranked) {
+    if (cutoffsByRegion[r.region]) r.cutoffs = cutoffsByRegion[r.region];
   }
 
   if (ranked.length === 0) {
@@ -85,18 +126,14 @@ export async function execute(interaction) {
     return interaction.editReply({ content: '❌ Failed to render the rank ladder.' });
   }
 
-  const embed = new EmbedBuilder()
-    .setTitle('📊 Tracked Players — Solo/Duo Ranks (live)')
-    .setColor(0x9b59b6);
+  const content = unranked.length > 0
+    ? `_Unranked / no data: ${unranked.map(p => displayName(p.riot_tag)).join(', ')}_`
+    : undefined;
 
-  if (unranked.length > 0) {
-    embed.setDescription(`_Unranked / no data: ${unranked.map(p => displayName(p.riot_tag)).join(', ')}_`);
-  }
-
-  // Chart attached at top level (no embed.setImage) so Discord renders it
-  // at the bigger native attachment size beneath the embed.
+  // No embed — Discord renders the attachment at full native size, and the
+  // PNG already shows "RANK LADDER" + "Tracked Players" in its header.
   return interaction.editReply({
-    embeds: [embed],
+    ...(content ? { content } : {}),
     files: [{ attachment: png, name: 'rank-ladder.png' }],
   });
 }

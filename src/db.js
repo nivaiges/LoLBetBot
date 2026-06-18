@@ -93,6 +93,9 @@ function migrate() {
   if (!gsCols.includes('emoji_enabled')) {
     db.exec(`ALTER TABLE guild_settings ADD COLUMN emoji_enabled INTEGER NOT NULL DEFAULT 1`);
   }
+  if (!gsCols.includes('auto_delete_enabled')) {
+    db.exec(`ALTER TABLE guild_settings ADD COLUMN auto_delete_enabled INTEGER NOT NULL DEFAULT 1`);
+  }
 
   // Add parley columns to active_matches if missing
   const cols = db.prepare("PRAGMA table_info('active_matches')").all().map(c => c.name);
@@ -546,6 +549,23 @@ export function setEmojiEnabled(guildId, enabled) {
   }
 }
 
+// When auto_delete is OFF, the bot preserves Match Detected / Match Over /
+// BETTING CLOSED messages instead of replacing or removing them on the next
+// match cycle. Default: ON (existing behavior).
+export function isAutoDeleteEnabled(guildId) {
+  const row = db.prepare('SELECT auto_delete_enabled FROM guild_settings WHERE guild_id = ?').get(guildId);
+  return row ? row.auto_delete_enabled === 1 : true;
+}
+
+export function setAutoDeleteEnabled(guildId, enabled) {
+  const row = db.prepare('SELECT guild_id FROM guild_settings WHERE guild_id = ?').get(guildId);
+  if (row) {
+    db.prepare('UPDATE guild_settings SET auto_delete_enabled = ?, updated_at = datetime(\'now\') WHERE guild_id = ?').run(enabled ? 1 : 0, guildId);
+  } else {
+    db.prepare('INSERT INTO guild_settings (guild_id, channel_id, auto_delete_enabled) VALUES (?, \'\', ?)').run(guildId, enabled ? 1 : 0);
+  }
+}
+
 // Parlay (per-match: all tracked players in the same game share one parlay)
 // legs is an array of { stat, label, type, line } objects
 export function setMatchParlay(guildId, matchId, legs) {
@@ -594,6 +614,12 @@ export function resolveParleyBet(betId, outcome) {
 // Message tracking (per-player: each tracked player in the same match has their own messages)
 export function setMatchMessageId(guildId, puuid, matchId, messageId) {
   db.prepare('UPDATE active_matches SET message_id = ? WHERE guild_id = ? AND puuid = ? AND match_id = ?').run(messageId, guildId, puuid, matchId);
+}
+
+// Same as setMatchMessageId but for every tracked-player row in this (guild,
+// match). Used for duos: both partners share a single Match Detected message.
+export function setMatchMessageIdForAllInMatch(guildId, matchId, messageId) {
+  db.prepare('UPDATE active_matches SET message_id = ? WHERE guild_id = ? AND match_id = ?').run(messageId, guildId, matchId);
 }
 
 export function setMatchCloseMessageId(guildId, puuid, matchId, messageId) {
@@ -1019,6 +1045,16 @@ export function settlePredict10(id, payout) {
     SET state = 'settled', payout = ?, settled_at = datetime('now')
     WHERE id = ?
   `).run(payout, id);
+}
+
+// First lp_history entry recorded at-or-after `sinceIso` (UTC, "YYYY-MM-DD
+// HH:MM:SS"). Used to compute weekly LP delta for the rank ladder.
+export function getEarliestLpSince(guildId, puuid, sinceIso) {
+  return db.prepare(`
+    SELECT tier, rank, lp FROM lp_history
+    WHERE guild_id = ? AND puuid = ? AND recorded_at >= ?
+    ORDER BY id ASC LIMIT 1
+  `).get(guildId, puuid, sinceIso);
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────

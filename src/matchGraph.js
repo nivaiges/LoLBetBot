@@ -5,6 +5,10 @@ import logger from './utils/logger.js';
 import { toAbsoluteLP, rankLabel } from './utils/rankMath.js';
 import { displayName } from './utils/displayName.js';
 import { getChampionIcon } from './utils/championIcons.js';
+import { getProfileIcon } from './utils/profileIcons.js';
+import { getRankEmblem, getRankMiniCrest } from './utils/rankEmblems.js';
+import { getLaneIcon } from './utils/laneIcons.js';
+import { getChampionSplash } from './utils/championSplash.js';
 
 // Asset-loader for objective icons. Drop PNGs (≈18×18) in assets/objectives/
 // named after the kind in lowercase (baron.png, herald.png, grubs.png,
@@ -266,6 +270,7 @@ async function renderSignedLineChart(series, opts = {}) {
     peakSuffix = '',  // appended after the index in callouts, e.g. 'm' for minute
     objectives = [],  // [{ kind: 'BARON'|'HERALD'|'GRUBS', minute, byAlly }]
     kills = [],       // [{ minute }] for the tracked player's kills
+    bg = BG,          // override panel background (defaults to legacy chart grey)
   } = opts;
 
   try {
@@ -283,7 +288,7 @@ async function renderSignedLineChart(series, opts = {}) {
     const ctx = canvas.getContext('2d');
     ctx.scale(SCALE, SCALE); // draw in logical units; output is 2×
 
-    ctx.fillStyle = BG;
+    ctx.fillStyle = bg;
     ctx.fillRect(0, 0, W, H);
 
     if (title) {
@@ -563,11 +568,12 @@ async function renderSignedLineChart(series, opts = {}) {
 
 export function renderGoldLeadPng(lead, opts = {}) {
   return renderSignedLineChart(lead, {
-    title: opts.title || 'Gold Graph',
+    title: opts.title != null ? opts.title : 'Gold Graph',
     yAxisLabel: 'Team Gold Lead',
     peakSuffix: 'm',
     objectives: opts.objectives || [],
     kills: opts.kills || [],
+    ...(opts.bg ? { bg: opts.bg } : {}),
   });
 }
 
@@ -826,6 +832,707 @@ export async function renderLpPng(entries, opts = {}) {
     return canvas.toBuffer('image/png');
   } catch (err) {
     logger.warn({ err: err.message }, 'matchGraph: LP canvas render failed');
+    return null;
+  }
+}
+
+// Profile-style LP card — replaces the legacy /lp embed render. Layout:
+//   1. Top header band: profile icon (with level badge) + RiotID + tier label
+//      on the left, big rank emblem on the right.
+//   2. Four stat tiles: Current LP, Peak LP, Win Rate donut, Games Tracked.
+//   3. Segmented progress bar with "X LP to NEXT_TIER" annotation.
+//   4. LP HISTORY line chart with tier-color line + green/red win-loss dots
+//      + a dashed "starting LP" reference line.
+//
+// Everything is tinted with the player's current tier color, on top of a
+// dark navy backdrop (matching the rest of our renders).
+export async function renderLpProfilePng(opts = {}) {
+  const {
+    riotTag,                // e.g. "Nivy#NA1"
+    summonerLevel = null,
+    profileIconId = null,
+    tier,                   // current tier (e.g. "MASTER")
+    rank,                   // current division (null for Master+)
+    lp,                     // current LP
+    wins = 0,
+    losses = 0,
+    entries = [],           // lp_history rows (tier, rank, lp, recorded_at)
+    cutoffs = null,         // { gm, chl } from getApexCutoffs(region)
+    topChampionInternalId = null, // for the faded top-right header decoration
+  } = opts;
+
+  if (!entries.length) return null;
+
+  try {
+    const SCALE = 2;
+    const W = 1100;
+    const padX = 24;
+
+    const tierColor = TIER_BAR_COLORS[tier] || '#5DADE2';
+
+    // ── Compute series (absolute LP) + min/max ─────────────────────────────
+    const series = entries
+      .map(e => ({ abs: toAbsoluteLP(e.tier, e.rank, e.lp), tier: e.tier, rank: e.rank, lp: e.lp }))
+      .filter(p => p.abs != null);
+    if (!series.length) return null;
+
+    const curAbs = toAbsoluteLP(tier, rank, lp) ?? series[series.length - 1].abs;
+    const peakEntry = series.reduce((a, b) => (a.abs >= b.abs ? a : b));
+    const peakLp = peakEntry.lp;
+    const peakLabel = MASTER_PLUS_TIERS.has(peakEntry.tier)
+      ? `${peakEntry.lp} LP`
+      : `${peakEntry.tier[0]}${({ I: 1, II: 2, III: 3, IV: 4 })[peakEntry.rank] || ''}-${peakEntry.lp}`;
+
+    // ── Layout heights ─────────────────────────────────────────────────────
+    const headerH = 300;
+    const statsH = 130;
+    const progressH = 48;
+    const chartH = 460;
+    const gap = 14;
+    const padBottom = 22;
+    const H = headerH + gap + statsH + gap + progressH + gap + chartH + padBottom;
+
+    const canvas = createCanvas(W * SCALE, H * SCALE);
+    const ctx = canvas.getContext('2d');
+    ctx.scale(SCALE, SCALE);
+
+    // ── Backdrop — dark navy gradient (consistent with other renders) ──────
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+    bgGrad.addColorStop(0, '#11131a');
+    bgGrad.addColorStop(1, '#070910');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    // ── HEADER BAND ────────────────────────────────────────────────────────
+    const headerY = 0;
+    {
+      const x = padX;
+      const y = headerY + 14;
+      const w = W - padX * 2;
+      const h = headerH - 14;
+
+      // Header card surface
+      ctx.fillStyle = '#10141d';
+      roundRect(ctx, x, y, w, h, 14);
+      ctx.fill();
+
+      // Top-champion splash in the top-right as a faded background — drawn
+      // BEFORE the icon/text so they stay sharply on top. Falls back
+      // silently when we don't have a champ ID or the splash fetch failed.
+      if (topChampionInternalId) {
+        try {
+          const champSplash = await getChampionSplash(topChampionInternalId);
+          if (champSplash) {
+            ctx.save();
+            // Clip to the card with rounded corners so the splash respects
+            // the card's edge radius.
+            ctx.beginPath();
+            roundRect(ctx, x, y, w, h, 14);
+            ctx.clip();
+
+            // Cover-fit the splash to the full card, then bias the source
+            // crop right so the champion's face lands on the right side.
+            const splashAR = champSplash.width / champSplash.height;
+            const cardAR = w / h;
+            let sw, sh, sx2, sy2;
+            if (splashAR > cardAR) {
+              sh = h;
+              sw = sh * splashAR;
+              sy2 = y;
+              sx2 = x + w - sw + (sw - w) * 0.10;
+            } else {
+              sw = w;
+              sh = sw / splashAR;
+              sx2 = x;
+              sy2 = y - (sh - h) / 2;
+            }
+            ctx.globalAlpha = 0.22;
+            ctx.drawImage(champSplash, sx2, sy2, sw, sh);
+            ctx.globalAlpha = 1;
+
+            // Fade-to-dark on the left half so the splash blends out behind
+            // the icon + name + tier label (which render afterward on top).
+            const fadeW = Math.round(w * 0.62);
+            const fadeGrad = ctx.createLinearGradient(x, y, x + fadeW, y);
+            fadeGrad.addColorStop(0,    'rgba(16,20,29,0.95)');
+            fadeGrad.addColorStop(0.55, 'rgba(16,20,29,0.55)');
+            fadeGrad.addColorStop(1,    'rgba(16,20,29,0)');
+            ctx.fillStyle = fadeGrad;
+            ctx.fillRect(x, y, fadeW, h);
+
+            ctx.restore();
+          }
+        } catch (err) {
+          logger.warn({ err: err.message }, 'lp profile: top-champion splash render failed');
+        }
+      }
+
+      ctx.save();
+      ctx.strokeStyle = tierColor;
+      ctx.globalAlpha = 0.32;
+      ctx.lineWidth = 1.4;
+      roundRect(ctx, x + 0.5, y + 0.5, w - 1, h - 1, 14);
+      ctx.stroke();
+      ctx.restore();
+
+      // Profile icon with tier-color ring + level badge
+      const iconR = 80;
+      const iconCx = x + 30 + iconR;
+      const iconCy = y + h / 2;
+
+      // Halo glow
+      const halo = ctx.createRadialGradient(iconCx, iconCy, iconR - 6, iconCx, iconCy, iconR + 22);
+      halo.addColorStop(0, 'rgba(0,0,0,0)');
+      halo.addColorStop(0.55, hexWithAlpha(tierColor, 0.30));
+      halo.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = halo;
+      ctx.beginPath();
+      ctx.arc(iconCx, iconCy, iconR + 22, 0, Math.PI * 2);
+      ctx.fill();
+
+      const profileIcon = profileIconId != null ? await getProfileIcon(profileIconId) : null;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(iconCx, iconCy, iconR, 0, Math.PI * 2);
+      ctx.clip();
+      if (profileIcon) {
+        ctx.drawImage(profileIcon, iconCx - iconR, iconCy - iconR, iconR * 2, iconR * 2);
+      } else {
+        ctx.fillStyle = '#2a2e38';
+        ctx.fillRect(iconCx - iconR, iconCy - iconR, iconR * 2, iconR * 2);
+      }
+      ctx.restore();
+      ctx.strokeStyle = tierColor;
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(iconCx, iconCy, iconR - 2, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Level badge — small dark pill at bottom of icon
+      if (summonerLevel != null) {
+        const lvlText = String(summonerLevel);
+        ctx.font = `900 16px ${FONT_STACK}`;
+        const lw = ctx.measureText(lvlText).width;
+        const bw = Math.max(48, lw + 18);
+        const bh = 26;
+        const bx = iconCx - bw / 2;
+        const by = iconCy + iconR - bh / 2;
+        ctx.fillStyle = '#0c0f17';
+        roundRect(ctx, bx, by, bw, bh, bh / 2);
+        ctx.fill();
+        ctx.strokeStyle = tierColor;
+        ctx.lineWidth = 1.5;
+        roundRect(ctx, bx + 0.5, by + 0.5, bw - 1, bh - 1, bh / 2);
+        ctx.stroke();
+        ctx.fillStyle = '#ffffff';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(lvlText, iconCx, by + bh / 2 + 1);
+      }
+
+      // Name + tier label
+      const tx = iconCx + iconR + 30;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = '#ffffff';
+      ctx.font = `900 56px ${FONT_STACK}`;
+      ctx.fillText(riotTag || '—', tx, y + h / 2 - 8);
+
+      // Mini-crest + tier label
+      const miniCrest = await getRankMiniCrest(tier);
+      const tierLabel = MASTER_PLUS_TIERS.has(tier) ? tier : `${tier} ${rank}`;
+      const labelY = y + h / 2 + 38;
+      const crestSize = 34;
+      if (miniCrest) {
+        const isWingFallback = miniCrest.width >= 500 || miniCrest.height >= 500;
+        if (isWingFallback) {
+          const sCrop = Math.min(miniCrest.width, miniCrest.height) * 0.85;
+          const sx = (miniCrest.width - sCrop) / 2;
+          const sy = (miniCrest.height - sCrop) / 2;
+          ctx.drawImage(miniCrest, sx, sy, sCrop, sCrop, tx, labelY - crestSize + 6, crestSize, crestSize);
+        } else {
+          ctx.drawImage(miniCrest, tx, labelY - crestSize + 6, crestSize, crestSize);
+        }
+      }
+      ctx.fillStyle = tierColor;
+      ctx.font = `900 30px ${FONT_STACK}`;
+      ctx.fillText(tierLabel, tx + crestSize + 12, labelY);
+
+    }
+
+    // ── STAT TILES ─────────────────────────────────────────────────────────
+    const statsY = headerH + gap;
+    {
+      const tileCount = 3;
+      const tileGap = 14;
+      const availW = W - padX * 2;
+      const tileW = (availW - tileGap * (tileCount - 1)) / tileCount;
+      const drawTile = (i, render) => {
+        const x = padX + i * (tileW + tileGap);
+        ctx.fillStyle = '#10141d';
+        roundRect(ctx, x, statsY, tileW, statsH, 12);
+        ctx.fill();
+        ctx.save();
+        ctx.strokeStyle = tierColor;
+        ctx.globalAlpha = 0.28;
+        ctx.lineWidth = 1.2;
+        roundRect(ctx, x + 0.5, statsY + 0.5, tileW - 1, statsH - 1, 12);
+        ctx.stroke();
+        ctx.restore();
+        render(x, statsY, tileW);
+      };
+
+      // Shared helper: render a "Current"-style tile with a tier mini-crest
+      // on the left and big LP + rank label on the right. Used by both
+      // Current and Peak tiles so the look stays uniform.
+      const drawRankTile = async (tileIndex, label, rankTier, rankDiv, rankLp) => {
+        const tileColor = TIER_BAR_COLORS[rankTier] || tierColor;
+        const crest = await getRankMiniCrest(rankTier);
+        // Override the tile border accent to match this rank's color.
+        drawTile(tileIndex, (x, y, w) => {
+          const crestSize = 56;
+          const crestX = x + 18;
+          const crestY = y + statsH / 2 - crestSize / 2;
+          if (crest) {
+            const isWingFallback = crest.width >= 500 || crest.height >= 500;
+            if (isWingFallback) {
+              const sCrop = Math.min(crest.width, crest.height) * 0.85;
+              const sx = (crest.width - sCrop) / 2;
+              const sy = (crest.height - sCrop) / 2;
+              ctx.drawImage(crest, sx, sy, sCrop, sCrop, crestX, crestY, crestSize, crestSize);
+            } else {
+              ctx.drawImage(crest, crestX, crestY, crestSize, crestSize);
+            }
+          }
+
+          // Right side text — label, LP, division
+          const rightX = crestX + crestSize + 14;
+          ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+          ctx.fillStyle = '#9aa0a6'; ctx.font = `13px ${FONT_STACK}`;
+          ctx.fillText(label, rightX, y + 32);
+          // Big LP number
+          const lpStr = String(rankLp);
+          ctx.fillStyle = '#ffffff'; ctx.font = `900 44px ${FONT_STACK}`;
+          ctx.fillText(lpStr, rightX, y + 78);
+          const lpW = ctx.measureText(lpStr).width;
+          ctx.fillStyle = '#7a818c'; ctx.font = `bold 14px ${FONT_STACK}`;
+          ctx.fillText('LP', rightX + lpW + 6, y + 78);
+          // Rank tag (e.g. "Diamond IV" / "Master")
+          const rankTag = MASTER_PLUS_TIERS.has(rankTier)
+            ? rankTier
+            : `${rankTier} ${rankDiv}`;
+          ctx.fillStyle = tileColor; ctx.font = `bold 14px ${FONT_STACK}`;
+          ctx.fillText(rankTag, rightX, y + 102);
+        });
+      };
+
+      await drawRankTile(0, 'Current', tier, rank, lp);
+      await drawRankTile(1, 'Peak',    peakEntry.tier, peakEntry.rank, peakEntry.lp);
+
+      // Win Rate — donut on left, big % + W/L on right (no duplicate %)
+      drawTile(2, (x, y, w) => {
+        const total = wins + losses;
+        const wr = total > 0 ? wins / total : 0;
+        const wrPct = Math.round(wr * 100);
+        const wrColor = wr >= 0.5 ? '#3ba55d' : '#ed4245';
+
+        // Donut on the left
+        const donutR = 34;
+        const donutCx = x + 26 + donutR;
+        const donutCy = y + statsH / 2;
+        ctx.lineWidth = 9;
+        ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+        ctx.beginPath();
+        ctx.arc(donutCx, donutCy, donutR, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.strokeStyle = wrColor;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.arc(donutCx, donutCy, donutR, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * wr);
+        ctx.stroke();
+        ctx.lineCap = 'butt';
+
+        // Label + big % + W/L on the right side of the tile
+        const rightX = donutCx + donutR + 22;
+        ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+        ctx.fillStyle = '#9aa0a6'; ctx.font = `14px ${FONT_STACK}`;
+        ctx.fillText('Win Rate', rightX, y + 32);
+        ctx.fillStyle = wrColor;
+        ctx.font = `900 42px ${FONT_STACK}`;
+        ctx.fillText(`${wrPct}%`, rightX, y + 78);
+        // W/L breakdown — green wins, red losses
+        ctx.fillStyle = '#3ba55d'; ctx.font = `bold 14px ${FONT_STACK}`;
+        const wText = `${wins}W`;
+        ctx.fillText(wText, rightX, y + 102);
+        const wTextW = ctx.measureText(wText).width;
+        ctx.fillStyle = '#ed4245';
+        ctx.fillText(` ${losses}L`, rightX + wTextW, y + 102);
+      });
+
+    }
+
+    // ── PROGRESS BAR ───────────────────────────────────────────────────────
+    const progressY = statsY + statsH + gap;
+    {
+      const milestone = nextRankMilestone(tier, rank, lp, cutoffs);
+      const barX = padX;
+      const barY = progressY + 16;
+      const barH = 16;
+      const labelW = 240; // reserved on the right for the label
+      const barW = W - padX * 2 - labelW - 16;
+
+      // Smooth track + fill — no segmentation since progress isn't really
+      // discretized into chunks (each game's LP delta is variable).
+      ctx.fillStyle = 'rgba(255,255,255,0.07)';
+      roundRect(ctx, barX, barY, barW, barH, barH / 2);
+      ctx.fill();
+      const fillFrac = milestone ? Math.max(0.02, Math.min(1, milestone.fraction)) : 1;
+      const fillW = Math.max(barH, fillFrac * barW);
+      ctx.fillStyle = tierColor;
+      roundRect(ctx, barX, barY, fillW, barH, barH / 2);
+      ctx.fill();
+
+      // Right-side label
+      const labelX = barX + barW + 16;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      const labelMidY = barY + barH / 2;
+      let labelText;
+      if (!milestone) {
+        labelText = 'Apex tier';
+      } else if (milestone.remaining === 0 && (milestone.nextLabel === 'Grandmaster' || milestone.nextLabel === 'Challenger')) {
+        labelText = `Awaiting ${milestone.nextLabel} promo`;
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `900 18px ${FONT_STACK}`;
+        ctx.fillText(labelText, labelX, labelMidY);
+      } else {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `900 18px ${FONT_STACK}`;
+        ctx.fillText(`${milestone.remaining}`, labelX, labelMidY);
+        const rmW = ctx.measureText(`${milestone.remaining}`).width;
+        ctx.fillStyle = '#9aa0a6';
+        ctx.font = `bold 15px ${FONT_STACK}`;
+        ctx.fillText(' LP to ', labelX + rmW, labelMidY);
+        const toW = ctx.measureText(' LP to ').width;
+        // Tint the destination tier name with that tier's color (e.g. GM in
+        // red, Challenger in gold) — not the player's current tier color.
+        const destTier = milestone.nextLabel.split(' ')[0].toUpperCase();
+        const destColor = TIER_BAR_COLORS[destTier] || tierColor;
+        ctx.fillStyle = destColor;
+        ctx.font = `900 18px ${FONT_STACK}`;
+        ctx.fillText(milestone.nextLabel.toUpperCase(), labelX + rmW + toW, labelMidY);
+      }
+    }
+
+    // ── LP HISTORY CHART ───────────────────────────────────────────────────
+    const chartY = progressY + progressH + gap;
+    {
+      const x = padX;
+      const y = chartY;
+      const w = W - padX * 2;
+      const h = chartH;
+
+      ctx.fillStyle = '#10141d';
+      roundRect(ctx, x, y, w, h, 14);
+      ctx.fill();
+      ctx.save();
+      ctx.strokeStyle = tierColor;
+      ctx.globalAlpha = 0.32;
+      ctx.lineWidth = 1.4;
+      roundRect(ctx, x + 0.5, y + 0.5, w - 1, h - 1, 14);
+      ctx.stroke();
+      ctx.restore();
+
+      // Title + tiny legend (green up / red down)
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = tierColor;
+      ctx.font = `bold 14px ${FONT_STACK}`;
+      ctx.fillText('📈  LP HISTORY', x + 18, y + 30);
+
+      // Right-aligned legend showing what the line colors mean.
+      const legendY = y + 28;
+      const legendX = x + w - 18;
+      const drawLegendPip = (lx, color) => {
+        ctx.fillStyle = color;
+        ctx.fillRect(lx, legendY - 8, 14, 4);
+      };
+      const lossText = 'Loss';
+      const winText  = 'Win';
+      ctx.font = `13px ${FONT_STACK}`;
+      ctx.textAlign = 'right'; ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = '#cfd6ff';
+      const lossTextW = ctx.measureText(lossText).width;
+      ctx.fillText(lossText, legendX, legendY);
+      drawLegendPip(legendX - lossTextW - 18, '#ed4245');
+
+      ctx.fillStyle = '#cfd6ff';
+      const winTailX = legendX - lossTextW - 18 - 14;
+      const winTextW = ctx.measureText(winText).width;
+      ctx.fillText(winText, winTailX, legendY);
+      drawLegendPip(winTailX - winTextW - 18, '#3ba55d');
+
+      // Plot area
+      const plotPadL = 70;
+      const plotPadR = 24;
+      const plotPadT = 58;
+      const plotPadB = 56;
+      const plotX = x + plotPadL;
+      const plotY = y + plotPadT;
+      const plotW = w - plotPadL - plotPadR;
+      const plotH = h - plotPadT - plotPadB;
+
+      // Y values — plot ABSOLUTE LP so the line is continuous across
+      // promotions/demotions. Y-axis labels then translate each tick value
+      // back into a rank string (e.g. 2400 → "D4", 2500 → "D3", 2800 →
+      // "MAS"). Above Master start (2800) we switch to "MAS X" raw LP.
+      const abs = series.map(p => p.abs);
+      const minVal = Math.min(...abs);
+      const maxVal = Math.max(...abs);
+      const span = Math.max(50, maxVal - minVal);
+      const padV = Math.max(40, span * 0.15);
+      const yMin = Math.max(0, Math.floor((minVal - padV) / 100) * 100);
+      const yMax = Math.ceil((maxVal + padV) / 100) * 100;
+      const yRange = yMax - yMin || 1;
+
+      // Tick label: rank for sub-master, "MAS N" for Master+. The actual
+      // tick *positions* are computed below alongside the grid pass.
+      const SUB_TIER_SHORT = ['I', 'B', 'S', 'G', 'P', 'E', 'D'];
+      const labelFor = (v) => {
+        if (v >= 2800) {
+          const masterLp = v - 2800;
+          return masterLp === 0 ? 'MAS' : `MAS ${masterLp}`;
+        }
+        // Sub-master: ti*400 + di*100 + raw_lp. Snap to division boundaries.
+        const ti = Math.floor(v / 400);
+        const di = Math.floor((v % 400) / 100);
+        const divNum = 4 - di; // di=0 → IV → 4, di=3 → I → 1
+        return `${SUB_TIER_SHORT[ti]}${divNum}`;
+      };
+
+      const yPx = v => plotY + plotH * (yMax - v) / yRange;
+      const xPx = i => plotX + (series.length === 1 ? plotW / 2 : plotW * i / (series.length - 1));
+
+      // Tier-zone backgrounds — each main tier (sub-master) gets a faint
+      // color band so the chart reads as a vertical rank ladder. Master+
+      // gets a current-tier band, with the area above the live apex cutoff
+      // tinted as the next tier when known.
+      const TIERS_ALL = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'MASTER', 'GRANDMASTER', 'CHALLENGER'];
+
+      const drawBand = (loV, hiV, color) => {
+        if (hiV <= loV) return;
+        const yTop = yPx(hiV);
+        const yBot = yPx(loV);
+        ctx.fillStyle = color;
+        ctx.fillRect(plotX, yTop, plotW, yBot - yTop);
+      };
+
+      // Apex cutoff (Master → GM or GM → Challenger) converted to absolute LP.
+      let apexCutoffAbs = null;
+      let apexNextTier = null;
+      if (tier === 'MASTER' && cutoffs?.gm != null) {
+        apexCutoffAbs = 2800 + cutoffs.gm;
+        apexNextTier = 'GRANDMASTER';
+      } else if (tier === 'GRANDMASTER' && cutoffs?.chl != null) {
+        apexCutoffAbs = 2800 + cutoffs.chl;
+        apexNextTier = 'CHALLENGER';
+      }
+
+      // Sub-master tier bands (one per 400-LP main tier).
+      for (let ti = 0; ti < 7; ti++) {
+        const lo = Math.max(yMin, ti * 400);
+        const hi = Math.min(yMax, (ti + 1) * 400);
+        if (hi <= lo) continue;
+        const bandColor = TIER_BAR_COLORS[TIERS_ALL[ti]] || '#888';
+        drawBand(lo, hi, hexWithAlpha(bandColor, 0.10));
+      }
+      // Master+ band (2800+). Split at the apex cutoff if we have one.
+      if (yMax > 2800) {
+        const masterBot = Math.max(yMin, 2800);
+        if (apexCutoffAbs != null && apexCutoffAbs > masterBot && apexCutoffAbs < yMax) {
+          drawBand(masterBot, apexCutoffAbs, hexWithAlpha(TIER_BAR_COLORS.MASTER, 0.10));
+          const nextColor = TIER_BAR_COLORS[apexNextTier] || TIER_BAR_COLORS.GRANDMASTER;
+          drawBand(apexCutoffAbs, yMax, hexWithAlpha(nextColor, 0.16));
+        } else {
+          drawBand(masterBot, yMax, hexWithAlpha(TIER_BAR_COLORS.MASTER, 0.10));
+        }
+      }
+
+      // Grid + Y tick labels — ticks at division boundaries (every 100 LP)
+      // for sub-master, every 100 LP starting at Master 0 for Master+. If
+      // the range is huge (e.g. spans multiple tiers), step up to keep the
+      // axis readable.
+      const niceStep = (yRange >= 800) ? 200 : 100;
+      ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+      ctx.lineWidth = 1;
+      ctx.fillStyle = '#9aa0a6';
+      ctx.font = `bold 12px ${FONT_STACK}`;
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      const firstTick = Math.ceil(yMin / niceStep) * niceStep;
+      for (let v = firstTick; v <= yMax; v += niceStep) {
+        const py = yPx(v);
+        ctx.beginPath();
+        ctx.moveTo(plotX, py);
+        ctx.lineTo(plotX + plotW, py);
+        ctx.stroke();
+        ctx.fillText(labelFor(v), plotX - 10, py);
+      }
+
+      // Dashed reference line at the Master tier threshold (2800) and at
+      // the apex cutoff when applicable.
+      const dashedLines = [];
+      if (2800 > yMin && 2800 < yMax) {
+        dashedLines.push({ v: 2800, color: TIER_BAR_COLORS.MASTER });
+      }
+      if (apexCutoffAbs != null && apexCutoffAbs > yMin && apexCutoffAbs < yMax) {
+        dashedLines.push({ v: apexCutoffAbs, color: TIER_BAR_COLORS[apexNextTier] || TIER_BAR_COLORS.GRANDMASTER });
+      }
+      for (const d of dashedLines) {
+        ctx.strokeStyle = hexWithAlpha(d.color, 0.85);
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([6, 5]);
+        ctx.beginPath();
+        ctx.moveTo(plotX, yPx(d.v));
+        ctx.lineTo(plotX + plotW, yPx(d.v));
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Y axis label
+      ctx.save();
+      ctx.translate(x + 22, plotY + plotH / 2);
+      ctx.rotate(-Math.PI / 2);
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#9aa0a6';
+      ctx.font = `bold 13px ${FONT_STACK}`;
+      ctx.fillText('LP', 0, 0);
+      ctx.restore();
+
+      // Fill area below the line — tier-color tint
+      ctx.fillStyle = hexWithAlpha(tierColor, 0.18);
+      ctx.beginPath();
+      ctx.moveTo(xPx(0), yPx(abs[0]));
+      for (let i = 1; i < abs.length; i++) ctx.lineTo(xPx(i), yPx(abs[i]));
+      ctx.lineTo(xPx(abs.length - 1), plotY + plotH);
+      ctx.lineTo(xPx(0), plotY + plotH);
+      ctx.closePath();
+      ctx.fill();
+
+      // Per-segment colored line — green if LP went up, red if it went down.
+      // Reads as a win/loss timeline at a glance, without depending on dots.
+      ctx.lineWidth = 2.2;
+      ctx.lineJoin = 'round';
+      for (let i = 1; i < abs.length; i++) {
+        const delta = abs[i] - abs[i - 1];
+        ctx.strokeStyle = delta > 0 ? '#3ba55d' : (delta < 0 ? '#ed4245' : tierColor);
+        ctx.beginPath();
+        ctx.moveTo(xPx(i - 1), yPx(abs[i - 1]));
+        ctx.lineTo(xPx(i), yPx(abs[i]));
+        ctx.stroke();
+      }
+
+      // Dots only at "real" peaks and pits — the local extremum within a
+      // ±WIN window. A single W-L-W blip in the middle of a winning streak
+      // won't generate dots; only the genuine turning points where the
+      // trend reverses for at least a few games. Plus the global high/low.
+      const peakIdx = abs.indexOf(Math.max(...abs));
+      const pitIdx = abs.indexOf(Math.min(...abs));
+      const WIN = Math.max(2, Math.floor(abs.length / 30)); // ~5 for 139-game series
+      const isLocalPeak = (i) => {
+        for (let j = Math.max(0, i - WIN); j <= Math.min(abs.length - 1, i + WIN); j++) {
+          if (j !== i && abs[j] > abs[i]) return false;
+        }
+        // Must strictly beat at least one side to avoid plateaus all dotting.
+        return (i > 0 && abs[i] > abs[i - 1]) || (i < abs.length - 1 && abs[i] > abs[i + 1]);
+      };
+      const isLocalPit = (i) => {
+        for (let j = Math.max(0, i - WIN); j <= Math.min(abs.length - 1, i + WIN); j++) {
+          if (j !== i && abs[j] < abs[i]) return false;
+        }
+        return (i > 0 && abs[i] < abs[i - 1]) || (i < abs.length - 1 && abs[i] < abs[i + 1]);
+      };
+
+      const markedDots = new Set([0, abs.length - 1, peakIdx, pitIdx]);
+      for (let i = 1; i < abs.length - 1; i++) {
+        if (isLocalPeak(i) || isLocalPit(i)) markedDots.add(i);
+      }
+      for (const i of markedDots) {
+        // Color the dot by which side of the trend it caps: peak = green
+        // (ended a winning run), pit = red (ended a losing run).
+        let color = tierColor;
+        if (i > 0 && i < abs.length - 1) {
+          if (abs[i] >= abs[i - 1] && abs[i] >= abs[i + 1]) color = '#3ba55d';
+          else if (abs[i] <= abs[i - 1] && abs[i] <= abs[i + 1]) color = '#ed4245';
+        } else if (i > 0) {
+          color = abs[i] > abs[i - 1] ? '#3ba55d' : '#ed4245';
+        }
+        const r = (i === peakIdx || i === pitIdx) ? 6 : 4.5;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(xPx(i), yPx(abs[i]), r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // X-axis ticks
+      ctx.fillStyle = '#9aa0a6';
+      ctx.font = `13px ${FONT_STACK}`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      const N = series.length - 1;
+      const xStep = Math.max(1, Math.ceil(N / 7));
+      let lastDrawn = -Infinity;
+      for (let i = 0; i <= N; i += xStep) {
+        ctx.fillText(String(i), xPx(i), plotY + plotH + 10);
+        lastDrawn = i;
+      }
+      if (lastDrawn !== N && N > 0) ctx.fillText(String(N), xPx(N), plotY + plotH + 10);
+
+      // X-axis title
+      ctx.fillStyle = '#9aa0a6';
+      ctx.font = `bold 13px ${FONT_STACK}`;
+      ctx.fillText('Games Tracked', plotX + plotW / 2, plotY + plotH + 32);
+
+      // End-of-line "X LP" callout
+      const lastX = xPx(N);
+      const lastY = yPx(abs[N]);
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(lastX, lastY, 6, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = tierColor;
+      ctx.beginPath();
+      ctx.arc(lastX, lastY, 5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Callout shows current rank short label + raw LP (e.g. "D4 45 LP",
+      // "MAS 575"). Built from the last entry's tier/rank/lp so it matches
+      // what Riot displays in-game, not the absolute-LP plot value.
+      const lastEntry = series[N];
+      const calloutText = MASTER_PLUS_TIERS.has(lastEntry.tier)
+        ? `${lastEntry.tier === 'MASTER' ? 'MAS' : lastEntry.tier === 'GRANDMASTER' ? 'GM' : 'CHA'} ${lastEntry.lp} LP`
+        : `${SUB_TIER_SHORT[Math.floor(lastEntry.abs / 400)]}${4 - Math.floor((lastEntry.abs % 400) / 100)} ${lastEntry.lp} LP`;
+      ctx.font = `900 14px ${FONT_STACK}`;
+      const ctw = ctx.measureText(calloutText).width;
+      const cpadX = 10;
+      const cpadY = 6;
+      const cw = ctw + cpadX * 2;
+      const ch = 24;
+      let cx = lastX - cw - 14;
+      const cy = lastY - ch / 2;
+      if (cx < plotX) cx = lastX + 14;
+      ctx.fillStyle = hexWithAlpha(tierColor, 0.85);
+      roundRect(ctx, cx, cy, cw, ch, 6);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(calloutText, cx + cw / 2, cy + ch / 2 + 1);
+    }
+
+    return canvas.toBuffer('image/png');
+  } catch (err) {
+    logger.warn({ err: err.message }, 'matchGraph: LP profile render failed');
     return null;
   }
 }
@@ -1111,12 +1818,99 @@ function formatRankShort(tier, rank, lp) {
 // "CURRENT PEAK!!" tag in yellow.
 //
 // `players` shape: [{ riot_tag, tier, rank, lp, peak_tier?, peak_rank?, peak_lp? }]
-export function renderRankLadderPng(players, opts = {}) {
+// Compute "X LP to {next tier or division}" + progress fraction for the bar.
+// `cutoffs` is { gm, chl } from getApexCutoffs(region); pass null/undefined to
+// fall back to a 250/500/750 LP banded milestone for Master+ when we don't
+// have a live cutoff.
+function nextRankMilestone(tier, rank, lp, cutoffs = null) {
+  const TIERS = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'MASTER', 'GRANDMASTER', 'CHALLENGER'];
+  const DIVS_DESC = ['IV', 'III', 'II', 'I'];
+  const ti = TIERS.indexOf(tier);
+  if (ti < 0) return null;
+  // Sub-master: progress within current division (0..100 LP).
+  if (ti < 7) {
+    const di = DIVS_DESC.indexOf(rank);
+    const remaining = Math.max(0, 100 - lp);
+    let nextLabel;
+    if (di < 0) nextLabel = '?';
+    else if (di === 3) {
+      // Promoting from Diamond I (or rare cases above) — the next tier is
+      // an apex tier with no division, so drop the trailing " IV".
+      const next = TIERS[ti + 1];
+      nextLabel = ['MASTER', 'GRANDMASTER', 'CHALLENGER'].includes(next)
+        ? capitalize(next)
+        : `${capitalize(next)} IV`;
+    }
+    else nextLabel = `${capitalize(tier)} ${DIVS_DESC[di + 1]}`;
+    return { remaining, nextLabel, fraction: Math.min(1, lp / 100) };
+  }
+  // Master / GM — live cutoff if we have it, otherwise band to next 250 step.
+  if (tier === 'MASTER') {
+    const live = cutoffs?.gm;
+    if (live != null && live > 0) {
+      return {
+        remaining: Math.max(0, live - lp),
+        nextLabel: 'Grandmaster',
+        fraction: Math.min(1, lp / live),
+      };
+    }
+    return bandedMilestone(lp, 'Grandmaster');
+  }
+  if (tier === 'GRANDMASTER') {
+    const live = cutoffs?.chl;
+    if (live != null && live > 0) {
+      return {
+        remaining: Math.max(0, live - lp),
+        nextLabel: 'Challenger',
+        fraction: Math.min(1, lp / live),
+      };
+    }
+    return bandedMilestone(lp, 'Challenger');
+  }
+  // Challenger — no further tier to climb; we still want a bar so it doesn't
+  // look broken next to lower-tier rows. Band to next 250 LP step.
+  if (tier === 'CHALLENGER') {
+    return bandedMilestone(lp, null);
+  }
+  return null;
+}
+
+// Fallback when we don't have a live apex cutoff: progress to the next round
+// 250-LP step (0..250..500..750..). `nextLabel` is "LP" with no destination
+// when we're at the top tier (no tier above).
+function bandedMilestone(lp, nextTierName) {
+  const step = 250;
+  const nextBand = Math.ceil((lp + 1) / step) * step;
+  const remaining = Math.max(0, nextBand - lp);
+  const prevBand = nextBand - step;
+  const fraction = (lp - prevBand) / step;
+  return {
+    remaining,
+    nextLabel: nextTierName ? nextTierName : `${nextBand} LP`,
+    fraction: Math.max(0, Math.min(1, fraction)),
+  };
+}
+
+function capitalize(s) {
+  if (!s) return '';
+  return s[0] + s.slice(1).toLowerCase();
+}
+
+// Compact "MAS 304" / "DIA II 50" peak label for the card subtitle.
+function compactPeakLabel(tier, rank, lp) {
+  const SHORT = { IRON: 'IRO', BRONZE: 'BRZ', SILVER: 'SLV', GOLD: 'GLD', PLATINUM: 'PLT', EMERALD: 'EMR', DIAMOND: 'DIA', MASTER: 'MAS', GRANDMASTER: 'GM', CHALLENGER: 'CHA' };
+  const t = SHORT[tier] || tier?.slice(0, 3);
+  if (['MASTER', 'GRANDMASTER', 'CHALLENGER'].includes(tier)) return `${t} ${lp}`;
+  return `${t} ${rank} ${lp}`;
+}
+
+export async function renderRankLadderPng(players, opts = {}) {
   if (!players?.length) return null;
   const {
-    title = 'Tracked Players — Rank Ladder',
-    decorateFirstLast = false, // 👑 on first, 🥀 on last — only when /rank passes this
-    bg = BG, // override canvas background for one-off tests
+    title = 'RANK LADDER',
+    subtitle = 'Tracked Players',
+    decorateFirstLast = false, // 👑 on first row, 🥀 on last row
+    bg = '#15171c', // dark navy bg matches the mockup
   } = opts;
 
   try {
@@ -1124,157 +1918,215 @@ export function renderRankLadderPng(players, opts = {}) {
       (toAbsoluteLP(b.tier, b.rank, b.lp) || 0) - (toAbsoluteLP(a.tier, a.rank, a.lp) || 0)
     );
 
-    const rowH = 40;
-    const padT = 44;
-    const padB = 32;
-    const padL = 18;
-    const padR = 18;
-    const nameW = 120;
-    const labelW = 260;
-    const W = 820;
-    const H = padT + rowH * sorted.length + padB;
-    const barX = padL + nameW;
-    const barAreaW = W - padL - padR - nameW - labelW;
-    const barH = 20;
+    // Card layout dimensions. Sized for Discord's ~720px attachment column —
+    // tall rows trade aspect ratio for in-chat row size (Discord downscales to
+    // fit width, so making rows taller is what actually grows the visible row).
+    const SCALE = 2;
+    const W = 920;
+    const padX = 18;
+    const headerH = 72;
+    const cardH = 120;
+    const cardGap = 10;
+    const padBottom = 22;
+    const H = headerH + sorted.length * cardH + Math.max(0, sorted.length - 1) * cardGap + padBottom;
 
-    const allAbs = sorted.flatMap(p => [
-      toAbsoluteLP(p.tier, p.rank, p.lp) || 0,
-      p.peak_tier ? (toAbsoluteLP(p.peak_tier, p.peak_rank, p.peak_lp) || 0) : 0,
-    ]);
-    const maxAbs = Math.max(...allAbs, 0);
-    const xMax = Math.max(2800, Math.ceil((maxAbs * 1.05) / 100) * 100);
-    const xPx = v => barX + barAreaW * v / xMax;
-
-    const canvas = createCanvas(W, H);
+    const canvas = createCanvas(W * SCALE, H * SCALE);
     const ctx = canvas.getContext('2d');
+    ctx.scale(SCALE, SCALE);
 
-    ctx.fillStyle = bg;
+    // Background gradient — slight diagonal to mimic the mockup.
+    const grad = ctx.createLinearGradient(0, 0, W, H);
+    grad.addColorStop(0, '#181b22');
+    grad.addColorStop(1, '#0f1118');
+    ctx.fillStyle = grad;
     ctx.fillRect(0, 0, W, H);
 
-    ctx.fillStyle = TITLE;
-    ctx.font = `bold 16px ${FONT_STACK}`;
-    ctx.textBaseline = 'top';
+    // ── Header — crown + title on a single line, no subtitle ───────────────
     ctx.textAlign = 'left';
-    ctx.fillText(title, padL, 12);
+    ctx.textBaseline = 'alphabetic';
+    const headerBaselineY = 56;
+    ctx.fillStyle = '#f0b232';
+    ctx.font = `900 36px ${FONT_STACK}`;
+    ctx.fillText('👑', padX, headerBaselineY);
+    ctx.fillStyle = '#fff';
+    ctx.font = `900 30px ${FONT_STACK}`;
+    ctx.fillText(title, padX + 46, headerBaselineY);
 
-    // Tier band backgrounds (vertical zones across all rows)
-    const bandTop = padT - 2;
-    const bandBot = H - padB + 2;
-    for (const band of TIER_BANDS) {
-      const xLo = xPx(Math.max(0, band.min));
-      const xHi = xPx(Math.min(xMax, band.max));
-      if (xHi <= xLo) continue;
-      ctx.fillStyle = band.color;
-      ctx.fillRect(xLo, bandTop, xHi - xLo, bandBot - bandTop);
-    }
-
-    // Tier boundary dashed lines
-    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([3, 3]);
-    for (const band of TIER_BANDS) {
-      if (band.min > 0 && band.min <= xMax) {
-        const x = xPx(band.min);
-        ctx.beginPath();
-        ctx.moveTo(x, bandTop);
-        ctx.lineTo(x, bandBot);
-        ctx.stroke();
-      }
-    }
-    ctx.setLineDash([]);
-
+    // ── Cards ───────────────────────────────────────────────────────────────
     for (let i = 0; i < sorted.length; i++) {
       const p = sorted[i];
-      const rowCenter = padT + rowH * i + rowH / 2;
+      const cardY = headerH + i * (cardH + cardGap);
+      const cardX = padX;
+      const cardW = W - padX * 2;
       const absCur = toAbsoluteLP(p.tier, p.rank, p.lp) || 0;
       const absPeak = p.peak_tier ? (toAbsoluteLP(p.peak_tier, p.peak_rank, p.peak_lp) || 0) : 0;
-      const color = TIER_BAR_COLORS[p.tier] || '#999';
-      const peakColor = TIER_BAR_COLORS[p.peak_tier] || color;
+      const tierColor = TIER_BAR_COLORS[p.tier] || '#999';
       const isPeaking = !p.peak_tier || absCur >= absPeak;
+      const isLeader = i === 0;
 
-      // Player name — last place gets a 🥀 prefix when decorateFirstLast
-      let namePrefix = '';
-      if (decorateFirstLast && sorted.length > 1 && i === sorted.length - 1) {
-        namePrefix = '🥀 ';
-      }
-      ctx.fillStyle = '#fff';
-      ctx.font = `bold 15px ${FONT_STACK}`;
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(namePrefix + displayName(p.riot_tag), padL, rowCenter);
-
-      // Background bar
-      ctx.fillStyle = 'rgba(255,255,255,0.04)';
-      ctx.fillRect(barX, rowCenter - barH / 2, barAreaW, barH);
-
-      // Peak extension (drawn first so current overlays it)
-      if (absPeak > absCur) {
-        const peakX = xPx(absPeak);
-        const curX = xPx(absCur);
-        ctx.fillStyle = peakColor + '40';
-        ctx.fillRect(curX, rowCenter - barH / 2, peakX - curX, barH);
-      }
-
-      // Solid current bar
-      const fillW = Math.max(2, xPx(absCur) - barX);
-      ctx.fillStyle = color;
-      ctx.fillRect(barX, rowCenter - barH / 2, fillW, barH);
-
-      // End-cap dot with optional yellow halo
-      const capX = barX + fillW;
-      if (isPeaking) {
-        ctx.fillStyle = PEAK_YELLOW;
-        ctx.beginPath();
-        ctx.arc(capX, rowCenter, barH / 2 + 4, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      ctx.arc(capX, rowCenter, barH / 2 + 1, 0, Math.PI * 2);
+      // Card background
+      ctx.fillStyle = '#1d2029';
+      roundRect(ctx, cardX, cardY, cardW, cardH, 10);
       ctx.fill();
-
-      // Peak tick marker
-      if (absPeak > absCur) {
-        const peakX = xPx(absPeak);
-        ctx.strokeStyle = peakColor;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(peakX, rowCenter - barH / 2 - 3);
-        ctx.lineTo(peakX, rowCenter + barH / 2 + 3);
+      // Left accent bar — gold for the leader, tier-color otherwise
+      ctx.fillStyle = isLeader ? '#f0b232' : tierColor;
+      roundRect(ctx, cardX, cardY, 4, cardH, 2);
+      ctx.fill();
+      // Leader gets a subtle gold border
+      if (isLeader) {
+        ctx.strokeStyle = 'rgba(240,178,50,0.6)';
+        ctx.lineWidth = 1.5;
+        roundRect(ctx, cardX + 0.5, cardY + 0.5, cardW - 1, cardH - 1, 10);
         ctx.stroke();
       }
 
-      // Right-side label
-      const labelX = W - padR - labelW + 4;
-      ctx.textAlign = 'left';
+      // ── Column 1: rank number (or crown for #1, rose for last) ───────────
+      const colNumCx = cardX + 40;
+      const cy = cardY + cardH / 2;
+      ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-
-      const curLabel = rankLabel(p.tier, p.rank, p.lp);
-      ctx.fillStyle = isPeaking ? PEAK_YELLOW : '#fff';
-      ctx.font = `bold 14px ${FONT_STACK}`;
-      ctx.fillText(curLabel, labelX, rowCenter);
-      const curW = ctx.measureText(curLabel).width;
-
-      if (isPeaking) {
-        ctx.fillStyle = PEAK_YELLOW;
-        ctx.font = `bold 13px ${FONT_STACK}`;
-        ctx.fillText('  ·  CURRENT PEAK!!', labelX + curW, rowCenter);
-      } else if (p.peak_tier) {
-        ctx.fillStyle = AXIS;
-        ctx.font = `13px ${FONT_STACK}`;
-        ctx.fillText(`  ·  peak: ${rankLabel(p.peak_tier, p.peak_rank, p.peak_lp)}`, labelX + curW, rowCenter);
+      if (decorateFirstLast && isLeader) {
+        ctx.font = `32px ${FONT_STACK}`;
+        ctx.fillText('👑', colNumCx, cy);
+      } else {
+        ctx.fillStyle = isLeader ? '#f0b232' : '#e8e8ea';
+        ctx.font = `900 32px ${FONT_STACK}`;
+        ctx.fillText(String(i + 1), colNumCx, cy);
       }
-    }
 
-    // Tier labels along the bottom
-    ctx.fillStyle = AXIS;
-    ctx.font = `11px ${FONT_STACK}`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'top';
-    for (const band of TIER_BANDS) {
-      const mid = (band.min + Math.min(band.max, xMax)) / 2;
-      if (mid > xMax) continue;
-      ctx.fillText(band.name, xPx(mid), H - padB + 6);
+      // ── Column 2: summoner icon (circle clipped) ─────────────────────────
+      const iconR = 34;
+      const iconCx = cardX + 102;
+      const iconCy = cy;
+      const icon = p.profileIconId != null ? await getProfileIcon(p.profileIconId) : null;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(iconCx, iconCy, iconR, 0, Math.PI * 2);
+      ctx.clip();
+      if (icon) {
+        ctx.drawImage(icon, iconCx - iconR, iconCy - iconR, iconR * 2, iconR * 2);
+      } else {
+        ctx.fillStyle = '#2a2e38';
+        ctx.fillRect(iconCx - iconR, iconCy - iconR, iconR * 2, iconR * 2);
+      }
+      ctx.restore();
+      ctx.strokeStyle = isLeader ? '#f0b232' : 'rgba(255,255,255,0.18)';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.arc(iconCx, iconCy, iconR - 1, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // ── Column 3: name + peak subtitle ───────────────────────────────────
+      const nameX = cardX + 152;
+      const nameDisplay = decorateFirstLast && i === sorted.length - 1 && sorted.length > 1
+        ? `🥀 ${displayName(p.riot_tag)}`
+        : displayName(p.riot_tag);
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#fff';
+      ctx.font = `bold 24px ${FONT_STACK}`;
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText(nameDisplay, nameX, cy - 5);
+      // At-peak players get a yellow "CURRENT PEAK!" tag here instead of the
+      // grey "Peak: X" subtitle — the big tier+LP label already conveys their
+      // current rank (which == peak) so the peak value isn't lost.
+      if (isPeaking && p.peak_tier) {
+        ctx.fillStyle = '#f0b232';
+        ctx.font = `bold 14px ${FONT_STACK}`;
+        ctx.fillText('CURRENT PEAK!', nameX, cy + 20);
+      } else {
+        ctx.fillStyle = '#7a818c';
+        ctx.font = `14px ${FONT_STACK}`;
+        ctx.fillText(`Peak: ${p.peak_tier ? compactPeakLabel(p.peak_tier, p.peak_rank, p.peak_lp) : '—'}`, nameX, cy + 20);
+      }
+
+      // ── Column 4: tier emblem ────────────────────────────────────────────
+      // Source emblems are 1280×720 with the actual crest centered and lots
+      // of empty space around it. Crop to a centered square that's ~60% of
+      // the shorter axis so the crest fills the destination box instead of
+      // shrinking into a small icon with whitespace around it.
+      const emblemSize = 116;
+      const emblemX = cardX + 315;
+      const emblem = await getRankEmblem(p.tier);
+      if (emblem) {
+        const sCrop = Math.min(emblem.width, emblem.height) * 0.85;
+        const sx = (emblem.width - sCrop) / 2;
+        const sy = (emblem.height - sCrop) / 2;
+        ctx.drawImage(emblem, sx, sy, sCrop, sCrop, emblemX, cy - emblemSize / 2, emblemSize, emblemSize);
+      } else {
+        ctx.fillStyle = tierColor;
+        ctx.fillRect(emblemX + emblemSize / 2 - 3, cy - 28, 6, 56);
+      }
+
+      // ── Column 5: TIER + LP big ──────────────────────────────────────────
+      const labelX = cardX + 450;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = tierColor;
+      ctx.font = `bold 16px ${FONT_STACK}`;
+      const tierLabel = ['MASTER', 'GRANDMASTER', 'CHALLENGER'].includes(p.tier)
+        ? p.tier
+        : `${p.tier} ${p.rank}`;
+      ctx.fillText(tierLabel, labelX, cy - 10);
+      ctx.fillStyle = '#fff';
+      ctx.font = `900 32px ${FONT_STACK}`;
+      const lpText = `${p.lp}`;
+      ctx.fillText(lpText, labelX, cy + 22);
+      const lpW = ctx.measureText(lpText).width;
+      ctx.fillStyle = '#7a818c';
+      ctx.font = `14px ${FONT_STACK}`;
+      ctx.fillText('LP', labelX + lpW + 6, cy + 22);
+
+      // ── Column 6: progress bar + sub label ───────────────────────────────
+      // Master+ has no milestone (dynamic apex-tier cutoffs we don't query).
+      // For those players we skip the bar entirely; the "CURRENT PEAK!" tag
+      // still shows as text if applicable.
+      const barX = cardX + 590;
+      const barW = 200;
+      const barH = 10;
+      const barY = cy - 5;
+      const milestone = nextRankMilestone(p.tier, p.rank, p.lp, p.cutoffs || null);
+
+      if (milestone) {
+        ctx.fillStyle = 'rgba(255,255,255,0.07)';
+        roundRect(ctx, barX, barY, barW, barH, barH / 2);
+        ctx.fill();
+        const fillW = Math.max(2, Math.min(barW, milestone.fraction * barW));
+        ctx.fillStyle = tierColor;
+        roundRect(ctx, barX, barY, fillW, barH, barH / 2);
+        ctx.fill();
+        // End-cap dot at the bar's fill edge — solid tier color, every row.
+        ctx.fillStyle = tierColor;
+        ctx.beginPath();
+        ctx.arc(barX + fillW, barY + barH / 2, 7, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Progress sub-text — always shows climb-to-next-tier (no longer the
+      // home of "CURRENT PEAK!"; that moved next to the LP big number).
+      ctx.fillStyle = '#7a818c';
+      ctx.font = `13px ${FONT_STACK}`;
+      let subText = '';
+      if (milestone?.nextLabel) {
+        const isApexNextTier = milestone.nextLabel === 'Grandmaster' || milestone.nextLabel === 'Challenger';
+        subText = (milestone.remaining === 0 && isApexNextTier)
+          ? `Awaiting ${milestone.nextLabel} promo`
+          : `${milestone.remaining} LP to ${milestone.nextLabel}`;
+      }
+      const subY = milestone ? barY + barH + 18 : cy + 8;
+      ctx.fillText(subText, barX, subY);
+
+      // ── Column 7: weekly LP delta ────────────────────────────────────────
+      const deltaX = cardX + cardW - 20;
+      if (p.weeklyDelta != null && Number.isFinite(p.weeklyDelta)) {
+        const positive = p.weeklyDelta >= 0;
+        ctx.textAlign = 'right';
+        ctx.fillStyle = positive ? '#3ba55d' : '#ed4245';
+        ctx.font = `bold 22px ${FONT_STACK}`;
+        ctx.fillText(`${positive ? '↑' : '↓'} ${Math.abs(p.weeklyDelta)}`, deltaX, cy - 5);
+        ctx.fillStyle = '#7a818c';
+        ctx.font = `13px ${FONT_STACK}`;
+        ctx.fillText('LP this week', deltaX, cy + 20);
+      }
     }
 
     return canvas.toBuffer('image/png');
@@ -1284,9 +2136,509 @@ export function renderRankLadderPng(players, opts = {}) {
   }
 }
 
-// Lane-aligned team composite for Match Detected — two rows of 5 champion
-// icons (blue team top, red team bottom) with a "VS" divider between, and
-// the tracked player's icon outlined in yellow.
+const LANE_BY_INDEX = ['TOP', 'JNG', 'MID', 'BOT', 'SUP'];
+
+function hexWithAlpha(hex, alpha) {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function fitText(ctx, str, maxW) {
+  if (!str) return '';
+  if (ctx.measureText(str).width <= maxW) return str;
+  let s = str;
+  while (s.length > 1 && ctx.measureText(s + '…').width > maxW) s = s.slice(0, -1);
+  return s + '…';
+}
+
+// Mockup-style Match Detected: header band + two team panels (BLUE/RED) with
+// per-player cards (champion icon w/ tier glow, lane icon overlay, name, tier
+// pill). Tracked player is highlighted with a gold ring + crown overlay +
+// italic gold name. Parlay/auto-bet footer cards are preserved.
+async function renderMatchDetectedCards(opts) {
+  const {
+    blueTeam, redTeam, highlightSet, labelFor,
+    getChampionInternalId, getChampionName,
+    title, subtitle, gameMode,
+    blueBans = [], redBans = [],
+    parlay = null, autoBets = [], autoBetStyle = 'plain',
+    betStatus = null, // { kind: 'open', minutes, winMult, loseMult } | { kind: 'closed', playerName }
+  } = opts;
+  const isTrackedPuuid = (puuid) => highlightSet && highlightSet.has(puuid);
+
+  try {
+    const SCALE = 2;
+    const W = 920;
+    const padX = 18;
+
+    const headerH = 100;
+
+    const panelInnerPadX = 14;
+    const panelHdrH = 38;
+    const cardCount = 5;
+    const cardGap = 8;
+    const panelW = W - padX * 2;
+    const cardsAreaW = panelW - panelInnerPadX * 2;
+    const cardW = (cardsAreaW - cardGap * (cardCount - 1)) / cardCount;
+    const cardH = 178;
+    const panelBottomPad = 12;
+    const panelH = panelHdrH + cardH + panelBottomPad;
+
+    const blueY = headerH + 4;
+    const teamGap = 22;
+    const redY = blueY + panelH + teamGap;
+    const gridBottom = redY + panelH;
+
+    const betStatusGap = 12;
+    const betStatusH = betStatus ? 42 : 0;
+    const betStatusY = gridBottom + (betStatus ? betStatusGap : 0);
+
+    const cardHeightFor = (n) => 24 + n * 22 + 12;
+    const fcardGap = 10;
+    const parlaySectionH = parlay ? (fcardGap + cardHeightFor(1)) : 0;
+    let autoSectionH = 0;
+    if (autoBets.length) {
+      autoSectionH = autoBetStyle === 'card'
+        ? fcardGap + cardHeightFor(autoBets.length)
+        : 20 + autoBets.length * 22 + 6;
+    }
+
+    const H = gridBottom + (betStatus ? betStatusGap + betStatusH : 0) + parlaySectionH + autoSectionH + 14;
+    const canvas = createCanvas(W * SCALE, H * SCALE);
+    const ctx = canvas.getContext('2d');
+    ctx.scale(SCALE, SCALE);
+
+    // Backdrop
+    {
+      const g = ctx.createLinearGradient(0, 0, 0, H);
+      g.addColorStop(0, '#0b0e16');
+      g.addColorStop(1, '#04060c');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    // ----- HEADER -----
+    const chipX = padX, chipY = 18, chipS = 60;
+    ctx.fillStyle = '#1a1d29';
+    roundRect(ctx, chipX, chipY, chipS, chipS, 12);
+    ctx.fill();
+    ctx.strokeStyle = '#2a2e3d';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = '#cfd6ff';
+    ctx.font = `900 30px ${FONT_STACK}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('⚔', chipX + chipS / 2, chipY + chipS / 2 + 2);
+
+    const tx = padX + chipS + 14;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = `900 28px ${FONT_STACK}`;
+    ctx.fillText(title || 'MATCH DETECTED', tx, 52);
+
+    if (subtitle) {
+      const m = subtitle.match(/^(.*?)\s+on\s+(.*)$/);
+      const baseY = 76;
+      if (m) {
+        const [, who, champ] = m;
+        ctx.font = `15px ${FONT_STACK}`;
+        ctx.fillStyle = '#cfd6ff';
+        ctx.fillText(who, tx, baseY);
+        const wWho = ctx.measureText(who).width;
+        ctx.fillStyle = '#9aa3bd';
+        ctx.fillText(' on ', tx + wWho, baseY);
+        const wOn = ctx.measureText(' on ').width;
+        ctx.font = `bold 15px ${FONT_STACK}`;
+        ctx.fillStyle = '#5ad6ff';
+        ctx.fillText(champ, tx + wWho + wOn, baseY);
+      } else {
+        ctx.font = `15px ${FONT_STACK}`;
+        ctx.fillStyle = '#cfd6ff';
+        ctx.fillText(subtitle, tx, baseY);
+      }
+    }
+
+    if (gameMode) {
+      ctx.font = `bold 13px ${FONT_STACK}`;
+      const ptw = ctx.measureText(gameMode).width;
+      const pW = ptw + 30;
+      const pH = 30;
+      const pXr = W - padX - pW;
+      const pYr = 32;
+      ctx.fillStyle = '#1a1d29';
+      roundRect(ctx, pXr, pYr, pW, pH, pH / 2);
+      ctx.fill();
+      ctx.strokeStyle = '#2a2e3d';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.fillStyle = '#cfd6ff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(gameMode, pXr + pW / 2, pYr + pH / 2 + 0.5);
+    }
+
+    // ----- TEAM PANEL -----
+    async function drawTeamPanel({ team, py, label, color, bans }) {
+      ctx.fillStyle = '#0e121c';
+      roundRect(ctx, padX, py, panelW, panelH, 14);
+      ctx.fill();
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = 0.35;
+      ctx.lineWidth = 1.5;
+      roundRect(ctx, padX + 0.75, py + 0.75, panelW - 1.5, panelH - 1.5, 13.5);
+      ctx.stroke();
+      ctx.restore();
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = 0.65;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(padX + 20, py + 0.5);
+      ctx.lineTo(padX + panelW - 20, py + 0.5);
+      ctx.stroke();
+      ctx.restore();
+
+      const hdrY = py + 8;
+      const labelX = padX + panelInnerPadX + 4;
+      const labelY = hdrY + 18;
+      ctx.font = `900 14px ${FONT_STACK}`;
+      ctx.fillStyle = color;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText('◆', labelX, labelY);
+      const flagW = ctx.measureText('◆').width;
+      ctx.fillText(label, labelX + flagW + 8, labelY);
+      const labelEnd = labelX + flagW + 8 + ctx.measureText(label).width;
+
+      const banSize = 24;
+      const banGap = 4;
+      const banCount = Math.min((bans || []).length, 5);
+      const bansW = banCount > 0 ? (banCount * (banSize + banGap) - banGap) : 0;
+      const bansX = padX + panelW - panelInnerPadX - bansW;
+      const lineEndX = banCount > 0 ? bansX - 10 : padX + panelW - panelInnerPadX;
+
+      ctx.save();
+      ctx.globalAlpha = 0.35;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(labelEnd + 10, labelY - 4);
+      ctx.lineTo(lineEndX, labelY - 4);
+      ctx.stroke();
+      ctx.restore();
+
+      for (let i = 0; i < banCount; i++) {
+        const bx = bansX + i * (banSize + banGap);
+        const by = hdrY + (panelHdrH - 8 - banSize) / 2;
+        ctx.fillStyle = '#1a1d29';
+        roundRect(ctx, bx, by, banSize, banSize, 5);
+        ctx.fill();
+        const champId = bans[i];
+        if (champId != null && champId !== -1) {
+          const internalId = getChampionInternalId(champId);
+          const icon = internalId ? await getChampionIcon(internalId) : null;
+          if (icon) {
+            ctx.save();
+            ctx.beginPath();
+            roundRect(ctx, bx + 1, by + 1, banSize - 2, banSize - 2, 4);
+            ctx.clip();
+            ctx.globalAlpha = 0.55;
+            ctx.drawImage(icon, bx + 1, by + 1, banSize - 2, banSize - 2);
+            ctx.restore();
+          }
+        }
+        ctx.strokeStyle = '#e74c3c';
+        ctx.lineWidth = 2.2;
+        ctx.beginPath();
+        ctx.moveTo(bx + 3, by + banSize - 3);
+        ctx.lineTo(bx + banSize - 3, by + 3);
+        ctx.stroke();
+      }
+
+      const cardsY = py + panelHdrH;
+      const cardsX0 = padX + panelInnerPadX;
+      for (let i = 0; i < team.length; i++) {
+        const p = team[i];
+        const cardX = cardsX0 + i * (cardW + cardGap);
+        const cardY = cardsY;
+        const isTracked = isTrackedPuuid(p.puuid);
+        const tierColor = TIER_BAR_COLORS[p.tier] || '#7a8190';
+
+        const cardBgGrad = ctx.createLinearGradient(cardX, cardY, cardX, cardY + cardH);
+        cardBgGrad.addColorStop(0, '#171b27');
+        cardBgGrad.addColorStop(1, '#0c1018');
+        ctx.fillStyle = cardBgGrad;
+        roundRect(ctx, cardX, cardY, cardW, cardH, 10);
+        ctx.fill();
+
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.globalAlpha = isTracked ? 0.85 : 0.30;
+        ctx.lineWidth = isTracked ? 1.8 : 1;
+        roundRect(ctx, cardX + 0.5, cardY + 0.5, cardW - 1, cardH - 1, 10);
+        ctx.stroke();
+        ctx.restore();
+
+        if (isTracked) {
+          ctx.save();
+          ctx.strokeStyle = PEAK_YELLOW;
+          ctx.globalAlpha = 0.7;
+          ctx.lineWidth = 2;
+          roundRect(ctx, cardX + 1.5, cardY + 1.5, cardW - 3, cardH - 3, 9);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        const avatarR = 40;
+        const cx = cardX + cardW / 2;
+        const cy = cardY + 16 + avatarR;
+
+        const internalId = getChampionInternalId(p.championId);
+        const icon = internalId ? await getChampionIcon(internalId) : null;
+
+        ctx.save();
+        const haloGrad = ctx.createRadialGradient(cx, cy, avatarR - 4, cx, cy, avatarR + 10);
+        haloGrad.addColorStop(0, 'rgba(0,0,0,0)');
+        haloGrad.addColorStop(0.6, hexWithAlpha(tierColor, 0.35));
+        haloGrad.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = haloGrad;
+        ctx.beginPath();
+        ctx.arc(cx, cy, avatarR + 10, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(cx, cy, avatarR, 0, Math.PI * 2);
+        ctx.clip();
+        if (icon) {
+          ctx.drawImage(icon, cx - avatarR, cy - avatarR, avatarR * 2, avatarR * 2);
+        } else {
+          ctx.fillStyle = 'rgba(255,255,255,0.06)';
+          ctx.fillRect(cx - avatarR, cy - avatarR, avatarR * 2, avatarR * 2);
+          ctx.fillStyle = '#aab';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.font = `bold 12px ${FONT_STACK}`;
+          ctx.fillText((getChampionName(p.championId) || '?').slice(0, 6), cx, cy);
+        }
+        ctx.restore();
+
+        ctx.strokeStyle = isTracked ? PEAK_YELLOW : tierColor;
+        ctx.lineWidth = isTracked ? 3 : 2.5;
+        ctx.beginPath();
+        ctx.arc(cx, cy, avatarR - 0.5, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // Lane overlay top-right of the avatar — same icon for tracked and
+        // non-tracked players. The tracked player's highlight (gold avatar
+        // ring + gold card border + gold italic name) is already enough
+        // distinction; using a yellow background here would wash out the
+        // white lane silhouette.
+        const overlayCx = cx + avatarR - 4;
+        const overlayCy = cy - avatarR + 4;
+        const lane = LANE_BY_INDEX[i];
+        const laneIcon = lane ? await getLaneIcon(lane) : null;
+        if (laneIcon) {
+          ctx.save();
+          ctx.fillStyle = 'rgba(15,17,25,0.85)';
+          ctx.beginPath();
+          ctx.arc(overlayCx, overlayCy, 11, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.drawImage(laneIcon, overlayCx - 9, overlayCy - 9, 18, 18);
+          ctx.restore();
+        }
+
+        const display = labelFor(p);
+        const nameY = cy + avatarR + 22;
+        ctx.fillStyle = isTracked ? PEAK_YELLOW : '#ffffff';
+        ctx.font = `${isTracked ? 'italic ' : ''}800 16px ${FONT_STACK}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'alphabetic';
+        const maxNameW = cardW - 18;
+        ctx.fillText(fitText(ctx, display, maxNameW), cx, nameY);
+
+        const pillTxt = formatRankShort(p.tier, p.rank, p.lp);
+        if (pillTxt) {
+          ctx.font = `bold 13px ${FONT_STACK}`;
+          // Mini-crest variant (80×80 square crops Riot ships) — already
+          // tightly cropped to the crest itself, so it stays crisp inside
+          // the small pill icon slot. Emerald falls back internally to the
+          // big wing emblem since Riot didn't ship a mini-crest for it.
+          const emblem = p.tier ? await getRankMiniCrest(p.tier) : null;
+          const isWingFallback = !!emblem && (emblem.width >= 500 || emblem.height >= 500);
+          const txtW = ctx.measureText(pillTxt).width;
+          const emblemSize = 22;
+          const pillPad = 10;
+          const pillW = txtW + (emblem ? emblemSize + 6 : 0) + pillPad;
+          const pillH = 30;
+          const pillX = cx - pillW / 2;
+          const pillY = cardY + cardH - pillH - 10;
+
+          ctx.fillStyle = '#1a1f2b';
+          roundRect(ctx, pillX, pillY, pillW, pillH, 6);
+          ctx.fill();
+          ctx.save();
+          ctx.strokeStyle = tierColor;
+          ctx.globalAlpha = 0.55;
+          ctx.lineWidth = 1;
+          roundRect(ctx, pillX + 0.5, pillY + 0.5, pillW - 1, pillH - 1, 6);
+          ctx.stroke();
+          ctx.restore();
+
+          let textX = pillX + pillPad / 2;
+          if (emblem) {
+            const emY = pillY + (pillH - emblemSize) / 2;
+            if (isWingFallback) {
+              // Emerald (wing-emblem fallback): source-crop the centered
+              // crest area before downscaling so the wing doesn't squish.
+              const sCrop = Math.min(emblem.width, emblem.height) * 0.85;
+              const sx = (emblem.width - sCrop) / 2;
+              const sy = (emblem.height - sCrop) / 2;
+              ctx.drawImage(emblem, sx, sy, sCrop, sCrop, pillX + 4, emY, emblemSize, emblemSize);
+            } else {
+              // Mini-crest: already pre-cropped, draw straight.
+              ctx.drawImage(emblem, pillX + 4, emY, emblemSize, emblemSize);
+            }
+            textX = pillX + 4 + emblemSize + 4;
+          }
+          ctx.fillStyle = tierColor;
+          ctx.textAlign = 'left';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(pillTxt, textX, pillY + pillH / 2 + 1);
+        }
+      }
+    }
+
+    await drawTeamPanel({ team: blueTeam, py: blueY, label: 'BLUE TEAM', color: '#5DADE2', bans: blueBans });
+    await drawTeamPanel({ team: redTeam, py: redY, label: 'RED TEAM', color: '#e74c3c', bans: redBans });
+
+    // VS diamond between the two panels
+    {
+      const cx = W / 2;
+      const cy = blueY + panelH + teamGap / 2;
+      const r = 18;
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillStyle = '#1a1d29';
+      ctx.strokeStyle = '#3a3f55';
+      ctx.lineWidth = 1.2;
+      roundRect(ctx, -r, -r, r * 2, r * 2, 4);
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+      ctx.fillStyle = '#cfd6ff';
+      ctx.font = `900 13px ${FONT_STACK}`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('VS', cx, cy + 1);
+    }
+
+    // ----- FOOTER (parlay + auto-bets) -----
+    const drawCard = (cardY, headerText, lines, accent = '#f0b232', lineFont = `14px ${FONT_STACK}`) => {
+      const ch = cardHeightFor(lines.length);
+      ctx.fillStyle = '#1e1f22';
+      roundRect(ctx, padX, cardY, W - padX * 2, ch, 10);
+      ctx.fill();
+      ctx.fillStyle = accent;
+      roundRect(ctx, padX, cardY, 4, ch, 2);
+      ctx.fill();
+      const innerX = padX + 16;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = accent;
+      ctx.font = `bold 11px ${FONT_STACK}`;
+      ctx.fillText(headerText, innerX, cardY + 16);
+      let ly = cardY + 24;
+      ctx.font = lineFont;
+      for (const line of lines) {
+        ctx.fillStyle = '#fff';
+        ctx.fillText(line, innerX, ly + 14);
+        ly += 22;
+      }
+      return ch;
+    };
+
+    // ----- BET-STATUS BANNER -----
+    if (betStatus) {
+      const bx = padX;
+      const by = betStatusY;
+      const bw = W - padX * 2;
+      const bh = betStatusH;
+      const isOpen = betStatus.kind === 'open';
+      const accent = isOpen ? '#f0b232' : '#7a8190';
+
+      ctx.fillStyle = isOpen ? '#1f1a0c' : '#161821';
+      roundRect(ctx, bx, by, bw, bh, 10);
+      ctx.fill();
+      ctx.save();
+      ctx.strokeStyle = accent;
+      ctx.globalAlpha = isOpen ? 0.7 : 0.45;
+      ctx.lineWidth = 1.2;
+      roundRect(ctx, bx + 0.5, by + 0.5, bw - 1, bh - 1, 10);
+      ctx.stroke();
+      ctx.restore();
+      // Left accent bar
+      ctx.fillStyle = accent;
+      roundRect(ctx, bx, by, 4, bh, 2);
+      ctx.fill();
+
+      const text = isOpen
+        ? `⏰  BETS CLOSE IN ${betStatus.minutes} MIN  ·  WIN ${betStatus.winMult}×  ·  LOSE ${betStatus.loseMult}×`
+        : `🔒  BETTING CLOSED${betStatus.playerName ? `  ·  ${betStatus.playerName.toUpperCase()}` : ''}`;
+      ctx.fillStyle = isOpen ? '#f6cf6a' : '#cfd6ff';
+      ctx.font = `900 16px ${FONT_STACK}`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, bx + bw / 2, by + bh / 2 + 1);
+    }
+
+    let fy = gridBottom + (betStatus ? betStatusGap + betStatusH : 0);
+    if (parlay) {
+      fy += fcardGap;
+      drawCard(fy, parlay.label, [parlay.legs], '#a974ff', `13px ${FONT_STACK}`);
+      fy += cardHeightFor(1);
+    }
+    if (autoBets.length) {
+      if (autoBetStyle === 'card') {
+        fy += fcardGap;
+        drawCard(fy, 'AUTO-BETS 🤖', autoBets);
+        fy += cardHeightFor(autoBets.length);
+      } else {
+        let ay = fy + 4;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'alphabetic';
+        ctx.fillStyle = '#80848e';
+        ctx.font = `bold 11px ${FONT_STACK}`;
+        ctx.fillText('AUTO-BETS 🤖', padX, ay + 11);
+        ay += 20;
+        ctx.font = `14px ${FONT_STACK}`;
+        for (const line of autoBets) {
+          ctx.fillStyle = '#fff';
+          ctx.fillText(line, padX, ay + 14);
+          ay += 22;
+        }
+      }
+    }
+
+    return canvas.toBuffer('image/png');
+  } catch (err) {
+    logger.warn({ err: err.message }, 'matchGraph: match-detected cards render failed');
+    return null;
+  }
+}
+
+// Lane-aligned team composite for Match Detected — two team panels, each with
+// a header (BLUE/RED label + bans), and 5 player cards (champion icon w/ tier
+// glow, lane icon overlay, name, tier+LP pill). Tracked player is highlighted
+// with a gold ring + crown + italic gold name.
 //
 // Expects `blueTeam` and `redTeam` already ordered TOP → JUNGLE → MID → BOT → SUP.
 export async function renderTeamsCompositePng(opts = {}) {
@@ -1294,6 +2646,7 @@ export async function renderTeamsCompositePng(opts = {}) {
     blueTeam = [],
     redTeam = [],
     trackedPuuid = null,
+    trackedPuuids = null,  // array form for duos; falls back to [trackedPuuid] when null
     getChampionInternalId, // (championId) => internal-id string (Data Dragon URL slug)
     getChampionName,       // (championId) => display name
     getLabel,              // optional (participant) => label string; defaults to champion name
@@ -1307,13 +2660,30 @@ export async function renderTeamsCompositePng(opts = {}) {
     parlay = null,         // { label, legs } — rendered as a card above auto-bets
     blueBans = [],         // array of champion IDs banned by blue team (in pick order)
     redBans = [],          // array of champion IDs banned by red team
-    teamLabels = false,    // change 1: BLUE/RED header per team (no side pill, no VS)
-    autoBetStyle = 'plain',// 'plain' | 'card' (change 2: separated auto-bet card)
+    teamLabels = false,    // BLUE/RED panel layout (mockup style)
+    autoBetStyle = 'plain',// 'plain' | 'card' (separated auto-bet card)
   } = opts;
 
   if (!blueTeam.length || !redTeam.length || !getChampionInternalId || !getChampionName) return null;
 
   const labelFor = (p) => (getLabel ? getLabel(p) : getChampionName(p.championId)) || getChampionName(p.championId) || '?';
+
+  // New "card panel" layout (matches the Match Detected mockup): two glowing
+  // team panels with player cards inside, plus the existing parlay/auto-bet
+  // footer cards. Driven by `teamLabels: true` from the poller.
+  if (teamLabels) {
+    const highlightSet = new Set(
+      (trackedPuuids && trackedPuuids.length ? trackedPuuids : [trackedPuuid]).filter(Boolean)
+    );
+    return renderMatchDetectedCards({
+      blueTeam, redTeam, highlightSet, labelFor,
+      getChampionInternalId, getChampionName,
+      title, subtitle, gameMode,
+      blueBans, redBans,
+      parlay, autoBets, autoBetStyle,
+      betStatus: opts.betStatus || null,
+    });
+  }
 
   try {
     const SCALE = 2;                       // supersample for a crisp hi-res PNG
@@ -1631,6 +3001,439 @@ export async function renderTeamsCompositePng(opts = {}) {
   }
 }
 
+// Splash-art Match Over: single-player variant where the champion's loading-
+// screen splash fills the player card (faded behind a left-side gradient so
+// the stats stay legible), then BETS SETTLED / PARLAY / ACHIEVEMENTS /
+// GOLD GRAPH render as separate cards below.
+async function renderMatchOverSplashPng({
+  won, durationStr, player,
+  getChampionInternalId,
+  bets, parlay, achievements,
+  lead, objectives, kills,
+}) {
+  const WIN = '#3ba55d';
+  const LOSE = '#ed4245';
+  const WHITE = '#ffffff';
+  const GREY = '#b5bac1';
+  const SUBTLE = '#80848e';
+  const accent = won ? WIN : LOSE;
+
+  try {
+    const SCALE = 2;
+    const W = 760;
+    const padX = 18;
+
+    // ── Pre-render the gold chart so we know its dimensions for layout ─────
+    // Pass bg + title='' so it blends into the dark splash card and doesn't
+    // duplicate the "GOLD GRAPH" widget label rendered by the outer card.
+    let goldImg = null;
+    if (lead && lead.length > 0) {
+      try {
+        const buf = await renderGoldLeadPng(lead, {
+          objectives, kills,
+          title: '',
+          bg: '#10141d',
+        });
+        if (buf) goldImg = await loadImage(buf);
+      } catch (err) {
+        logger.warn({ err: err.message }, 'matchGraph: gold chart render failed inside match-over');
+      }
+    }
+    const chartInnerW = W - padX * 2 - 24;
+    const chartH = goldImg ? Math.round(goldImg.height * (chartInnerW / goldImg.width)) : 0;
+
+    // ── Section heights ────────────────────────────────────────────────────
+    const headerH = 84;
+    const playerCardH = 220;
+    const sectionGap = 12;
+
+    const lineH = 26;
+    // Cards: label sits ~22px from card-top; row cards need extra clearance
+    // so the structured icon box doesn't overlap header text. The chart card
+    // doesn't have rows — it can hug the header much tighter, saving the
+    // ~20px of empty band that otherwise sits above the chart.
+    const cardHeaderH = 50;
+    const chartHeaderH = 30;
+    const cardBodyPad = 12;
+    const computeCardH = (rowCount) => rowCount > 0 ? (cardHeaderH + rowCount * lineH + cardBodyPad) : 0;
+
+    const betsH = computeCardH(bets.length);
+    const parlayH = computeCardH(parlay.length);
+    const chartCardH = goldImg ? (chartHeaderH + chartH + cardBodyPad) : 0;
+
+    const sectionsTotal = [betsH, parlayH, chartCardH].filter(h => h > 0).length;
+    const totalGapAfterSections = sectionsTotal * sectionGap;
+
+    const padBottom = 16;
+    const H = headerH + sectionGap + playerCardH + totalGapAfterSections + betsH + parlayH + chartCardH + padBottom;
+
+    const canvas = createCanvas(W * SCALE, H * SCALE);
+    const ctx = canvas.getContext('2d');
+    ctx.scale(SCALE, SCALE);
+
+    // Backdrop
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+    bgGrad.addColorStop(0, '#0c0f17');
+    bgGrad.addColorStop(1, '#06080d');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    // ── HEADER ─────────────────────────────────────────────────────────────
+    // Accent bar on the very left
+    ctx.fillStyle = accent;
+    roundRect(ctx, 0, 16, 6, 52, 3);
+    ctx.fill();
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = WHITE;
+    ctx.font = `900 42px ${FONT_STACK}`;
+    ctx.fillText('MATCH OVER', padX + 12, 58);
+
+    // Victory / Defeat chip + duration
+    {
+      const chipText = won ? 'VICTORY' : 'DEFEAT';
+      const chipIcon = won ? '✓' : '✕';
+      ctx.font = `900 20px ${FONT_STACK}`;
+      const ctw = ctx.measureText(chipText).width;
+      const chipPadX = 18;
+      const chipW = ctw + chipPadX * 2 + 24;
+      const chipH = 44;
+      ctx.font = `14px ${FONT_STACK}`;
+      const durW = ctx.measureText(durationStr).width;
+      const groupW = chipW + 14 + durW;
+      const groupX = W - padX - groupW;
+      const chipX = groupX;
+      const chipY = 20;
+
+      ctx.fillStyle = hexWithAlpha(accent, 0.18);
+      roundRect(ctx, chipX, chipY, chipW, chipH, 10);
+      ctx.fill();
+      ctx.save();
+      ctx.strokeStyle = accent;
+      ctx.globalAlpha = 0.75;
+      ctx.lineWidth = 1.3;
+      roundRect(ctx, chipX + 0.5, chipY + 0.5, chipW - 1, chipH - 1, 10);
+      ctx.stroke();
+      ctx.restore();
+
+      ctx.fillStyle = accent;
+      ctx.font = `900 20px ${FONT_STACK}`;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(chipIcon, chipX + chipPadX, chipY + chipH / 2);
+      ctx.fillText(chipText, chipX + chipPadX + 22, chipY + chipH / 2);
+
+      ctx.fillStyle = SUBTLE;
+      ctx.font = `bold 18px ${FONT_STACK}`;
+      ctx.fillText(durationStr, chipX + chipW + 14, chipY + chipH / 2);
+    }
+
+    // ── PLAYER CARD ────────────────────────────────────────────────────────
+    const playerCardY = headerH + sectionGap;
+    const playerCardW = W - padX * 2;
+    await drawPlayerSplashCard({
+      ctx, x: padX, y: playerCardY, w: playerCardW, h: playerCardH,
+      player, accent, won, getChampionInternalId, WIN, LOSE,
+    });
+
+    // ── HELPERS: card rendering ────────────────────────────────────────────
+    const drawCard = (y, h, label, accentColor) => {
+      const cardW = W - padX * 2;
+      ctx.fillStyle = '#10141d';
+      roundRect(ctx, padX, y, cardW, h, 12);
+      ctx.fill();
+      ctx.save();
+      ctx.strokeStyle = accentColor;
+      ctx.globalAlpha = 0.30;
+      ctx.lineWidth = 1.2;
+      roundRect(ctx, padX + 0.5, y + 0.5, cardW - 1, h - 1, 12);
+      ctx.stroke();
+      ctx.restore();
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = accentColor;
+      ctx.font = `bold 13px ${FONT_STACK}`;
+      ctx.fillText(label, padX + 16, y + 22);
+    };
+
+    const drawSettledRow = (lineY, text) => {
+      // Poller-formatted lines start with ✅ or ❌. The two emojis have very
+      // different widths/baselines depending on the host font, which makes
+      // multiple rows look misaligned. Strip the leading status emoji and
+      // draw a structured icon (small filled square + glyph) at a fixed x
+      // position so every row's icon column AND text column line up.
+      const stripped = text.replace(/^(?:✅|❌)\s*/, '');
+      const correct = text.startsWith('✅');
+
+      const iconX = padX + 20;
+      const iconSize = 18;
+      const iconY = lineY - 8 - iconSize / 2;
+      ctx.fillStyle = correct ? hexWithAlpha(WIN, 0.22) : hexWithAlpha(LOSE, 0.22);
+      roundRect(ctx, iconX, iconY, iconSize, iconSize, 4);
+      ctx.fill();
+      ctx.fillStyle = correct ? WIN : LOSE;
+      ctx.font = `bold 13px ${FONT_STACK}`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(correct ? '✓' : '✕', iconX + iconSize / 2, iconY + iconSize / 2 + 1);
+
+      ctx.fillStyle = WHITE;
+      ctx.font = `15px ${FONT_STACK}`;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(stripped, iconX + iconSize + 10, lineY - 8);
+    };
+
+    let cy = playerCardY + playerCardH + sectionGap;
+
+    if (bets.length) {
+      drawCard(cy, betsH, '🏛  BETS SETTLED', '#cfd6ff');
+      let lineY = cy + cardHeaderH + 4;
+      for (const b of bets) {
+        drawSettledRow(lineY, b);
+        lineY += lineH;
+      }
+      cy += betsH + sectionGap;
+    }
+
+    if (parlay.length) {
+      drawCard(cy, parlayH, '🎰  PARLAY', '#a974ff');
+      let lineY = cy + cardHeaderH + 4;
+      for (const p of parlay) {
+        ctx.fillStyle = WHITE;
+        ctx.font = `15px ${FONT_STACK}`;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(p, padX + 20, lineY - 8);
+        lineY += lineH;
+      }
+      cy += parlayH + sectionGap;
+    }
+
+    // Achievements section intentionally omitted from the image — the poller
+    // still surfaces achievements through other channels but they never get
+    // drawn into the Match Over splash recap.
+
+    if (goldImg) {
+      drawCard(cy, chartCardH, '🪙  GOLD GRAPH', '#f0b232');
+      const chartX = padX + 12;
+      const chartY = cy + chartHeaderH;
+      ctx.save();
+      roundRect(ctx, chartX, chartY, chartInnerW, chartH, 8);
+      ctx.clip();
+      ctx.drawImage(goldImg, chartX, chartY, chartInnerW, chartH);
+      ctx.restore();
+    }
+
+    return canvas.toBuffer('image/png');
+  } catch (err) {
+    logger.warn({ err: err.message }, 'matchGraph: match-over splash render failed');
+    return null;
+  }
+}
+
+// Draws the single-player splash-art card inside the Match Over recap.
+// Splash art fills the right portion of the card, faded behind a dark
+// gradient on the left so stats stay readable. Avatar + name + KDA + stat
+// row sit on the left; "Today record" + lane indicator sit top-right.
+async function drawPlayerSplashCard({ ctx, x, y, w, h, player, accent, won, getChampionInternalId, WIN, LOSE }) {
+  const WHITE = '#ffffff';
+  const GREY = '#b5bac1';
+  const SUBTLE = '#80848e';
+  const internalId = getChampionInternalId ? getChampionInternalId(player.championId) : null;
+
+  // Card base (dark)
+  ctx.fillStyle = '#10141d';
+  roundRect(ctx, x, y, w, h, 14);
+  ctx.fill();
+
+  // Splash art behind everything, clipped to the card. Cover-fit so it fills
+  // the card without distortion, then a left-side gradient fades it out so
+  // the avatar/name/stats remain readable on top of solid dark.
+  ctx.save();
+  roundRect(ctx, x, y, w, h, 14);
+  ctx.clip();
+
+  const splash = internalId ? await getChampionSplash(internalId) : null;
+  if (splash) {
+    // Center-fit cover. The centered splash variant from Community Dragon
+    // puts the champion's face in the middle of the frame, so a straight
+    // cover-fit (no left/right bias) reliably shows the head every time.
+    const splashAR = splash.width / splash.height;
+    const cardAR = w / h;
+    let sw, sh, sx, sy;
+    if (splashAR > cardAR) {
+      sh = h;
+      sw = sh * splashAR;
+      sx = x - (sw - w) / 2;
+      sy = y;
+    } else {
+      sw = w;
+      sh = sw / splashAR;
+      sx = x;
+      sy = y - (sh - h) / 2;
+    }
+    ctx.globalAlpha = 0.55;
+    ctx.drawImage(splash, sx, sy, sw, sh);
+    ctx.globalAlpha = 1;
+  }
+
+  // Left-side darkening gradient — opaque on the left, fades to transparent
+  // around the 70% mark so the right side stays mostly splash.
+  const leftGrad = ctx.createLinearGradient(x, y, x + w, y);
+  leftGrad.addColorStop(0,    'rgba(16,20,29,0.95)');
+  leftGrad.addColorStop(0.45, 'rgba(16,20,29,0.65)');
+  leftGrad.addColorStop(1,    'rgba(16,20,29,0.20)');
+  ctx.fillStyle = leftGrad;
+  ctx.fillRect(x, y, w, h);
+
+  ctx.restore();
+
+  // Card outline (accent color, faint)
+  ctx.save();
+  ctx.strokeStyle = accent;
+  ctx.globalAlpha = 0.40;
+  ctx.lineWidth = 1.4;
+  roundRect(ctx, x + 0.5, y + 0.5, w - 1, h - 1, 14);
+  ctx.stroke();
+  ctx.restore();
+
+  // ── Avatar ───────────────────────────────────────────────────────────────
+  const avatarR = 50;
+  const avatarCx = x + 30 + avatarR;
+  const avatarCy = y + h / 2;
+  const icon = internalId ? await getChampionIcon(internalId) : null;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(avatarCx, avatarCy, avatarR, 0, Math.PI * 2);
+  ctx.clip();
+  if (icon) {
+    ctx.drawImage(icon, avatarCx - avatarR, avatarCy - avatarR, avatarR * 2, avatarR * 2);
+  } else {
+    ctx.fillStyle = '#2a2e38';
+    ctx.fillRect(avatarCx - avatarR, avatarCy - avatarR, avatarR * 2, avatarR * 2);
+  }
+  ctx.restore();
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(avatarCx, avatarCy, avatarR - 1, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // ── Name + champion subtitle ────────────────────────────────────────────
+  const tx = avatarCx + avatarR + 24;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = WHITE;
+  ctx.font = `900 30px ${FONT_STACK}`;
+  ctx.fillText(player.name, tx, y + 50);
+
+  // Champion subtitle line — use the champion icon as a tiny inline marker
+  if (icon) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(tx + 10, y + 70, 9, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.drawImage(icon, tx + 1, y + 61, 18, 18);
+    ctx.restore();
+  }
+  ctx.fillStyle = GREY;
+  ctx.font = `15px ${FONT_STACK}`;
+  ctx.fillText(player.champName || '', tx + 26, y + 75);
+
+  // ── KDA big ──────────────────────────────────────────────────────────────
+  const kdaY = y + 122;
+  ctx.font = `900 44px ${FONT_STACK}`;
+  const kStr = String(player.k);
+  const slash = ' / ';
+  const dStr = String(player.d);
+  const aStr = String(player.a);
+  const wK = ctx.measureText(kStr).width;
+  const wS = ctx.measureText(slash).width;
+  const wD = ctx.measureText(dStr).width;
+  let cx = tx;
+  ctx.fillStyle = WIN;
+  ctx.fillText(kStr, cx, kdaY);   cx += wK;
+  ctx.fillStyle = SUBTLE;
+  ctx.fillText(slash, cx, kdaY);  cx += wS;
+  ctx.fillStyle = LOSE;
+  ctx.fillText(dStr, cx, kdaY);   cx += wD;
+  ctx.fillStyle = SUBTLE;
+  ctx.fillText(slash, cx, kdaY);  cx += wS;
+  ctx.fillStyle = '#5ad6ff';
+  ctx.fillText(aStr, cx, kdaY);
+
+  // "Perfect KDA" sub-label when no deaths
+  if (player.d === 0) {
+    ctx.fillStyle = WIN;
+    ctx.font = `bold 14px ${FONT_STACK}`;
+    ctx.fillText('Perfect KDA', tx, kdaY + 22);
+  } else if (player.kda) {
+    ctx.fillStyle = SUBTLE;
+    ctx.font = `bold 14px ${FONT_STACK}`;
+    ctx.fillText(`${player.kda} KDA`, tx, kdaY + 22);
+  }
+
+  // ── Stats row ────────────────────────────────────────────────────────────
+  const statsY = y + h - 26;
+  const drawStat = (sx, label, value) => {
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = WHITE;
+    ctx.font = `900 22px ${FONT_STACK}`;
+    ctx.fillText(value, sx, statsY);
+    const vw = ctx.measureText(value).width;
+    ctx.fillStyle = SUBTLE;
+    ctx.font = `11px ${FONT_STACK}`;
+    ctx.fillText(label, sx, statsY + 14);
+    return vw;
+  };
+
+  let sx = tx;
+  const w1 = drawStat(sx, 'CS', String(player.cs ?? '—'));
+  sx += Math.max(w1, 40) + 36;
+  const w2 = drawStat(sx, 'DMG', formatNumber(player.dmg));
+  sx += Math.max(w2, 60) + 36;
+  drawStat(sx, 'KP', player.kp != null ? `${player.kp}%` : '—');
+
+  // ── Right side: today pill + lane indicator ─────────────────────────────
+  const rx = x + w - 22;
+  const total = (player.dailyW || 0) + (player.dailyL || 0);
+  const flame = total > 0 && player.dailyW / total > 0.5 ? ' 🔥' : '';
+  const todayText = `Today: ${player.dailyW || 0}W ${player.dailyL || 0}L${flame}`;
+
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = GREY;
+  ctx.font = `bold 14px ${FONT_STACK}`;
+  ctx.fillText(todayText, rx, y + 38);
+
+  // Lane indicator below
+  if (player.wonLane != null) {
+    const laneMargin = (typeof player.laneDiff === 'number')
+      ? (() => { const ab = Math.abs(player.laneDiff); const s = player.laneDiff >= 0 ? '+' : '-'; return ` ${s}${ab >= 1000 ? (ab / 1000).toFixed(1) + 'k' : ab}`; })()
+      : '';
+    if (player.wonLane === true) {
+      ctx.fillStyle = WIN;
+      ctx.font = `bold 14px ${FONT_STACK}`;
+      ctx.fillText(`✓ Won Lane${laneMargin}`, rx, y + 62);
+    } else if (player.wonLane === false) {
+      ctx.fillStyle = LOSE;
+      ctx.font = `bold 14px ${FONT_STACK}`;
+      ctx.fillText(`✕ Lost Lane${laneMargin}`, rx, y + 62);
+    }
+  }
+}
+
+function formatNumber(n) {
+  if (n == null) return '—';
+  if (n >= 1000) return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+  return String(n);
+}
+
 // Full Match Over recap as a single image: header + per-player cards + bets /
 // parlay / achievements sections + the gold-lead chart embedded at the bottom.
 // All text is rendered (no Discord markdown / mentions), so callers must pass
@@ -1657,6 +3460,17 @@ export async function renderMatchOverPng(opts = {}) {
   } = opts;
 
   if (!players.length) return null;
+
+  // Splash-art layout — only used when there's a single tracked player.
+  // Duos fall through to the original compact layout (the splash card needs
+  // too much vertical space to stack two of them comfortably).
+  if (players.length === 1) {
+    return renderMatchOverSplashPng({
+      won, durationStr, player: players[0],
+      getChampionInternalId, bets, parlay, achievements,
+      lead, objectives, kills,
+    });
+  }
 
   const CARD = '#1e1f22';
   const WHITE = '#ffffff';
@@ -1690,10 +3504,10 @@ export async function renderMatchOverPng(opts = {}) {
     const sectionGap = 16;
     const betsH = bets.length ? (24 + bets.length * 24 + sectionGap) : 0;
     const parlayH = parlay.length ? (24 + parlay.length * 24 + sectionGap) : 0;
-    const achH = achievements.length ? (24 + achievements.length * 24 + sectionGap) : 0;
     const chartBlockH = goldImg ? chartH + 12 : 0;
     const padBottom = 16;
-    const H = headerH + 10 + cardsH + sectionGap + betsH + parlayH + achH + chartBlockH + padBottom;
+    // Achievements section intentionally dropped from the image.
+    const H = headerH + 10 + cardsH + sectionGap + betsH + parlayH + chartBlockH + padBottom;
 
     const canvas = createCanvas(W * SCALE, H * SCALE);
     const ctx = canvas.getContext('2d');
@@ -1814,7 +3628,6 @@ export async function renderMatchOverPng(opts = {}) {
 
     drawSection('Bets Settled', bets);
     drawSection('Parlay', parlay);
-    drawSection('Achievements', achievements);
 
     if (goldImg) {
       ctx.save();

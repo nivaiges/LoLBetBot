@@ -43,6 +43,7 @@ import * as autobet from './commands/autobet.js';
 import * as removeuser from './commands/removeuser.js';
 import * as give from './commands/give.js';
 import * as emoji from './commands/emoji.js';
+import * as autodelete from './commands/autodelete.js';
 import * as history from './commands/history.js';
 import * as achievements from './commands/achievements.js';
 import * as help from './commands/help.js';
@@ -78,7 +79,7 @@ if (!RIOT_API_KEY) {
 
 // ── Build command collection ─────────────────────────────────────────────────
 
-const commands = [collect, adduser, removeuser, bet, baltop, stats, rank, bethere, records, lp, lpc, autobet, give, emoji, history, achievements, help, duo, predict10, predictions];
+const commands = [collect, adduser, removeuser, bet, baltop, stats, rank, bethere, records, lp, lpc, autobet, give, emoji, autodelete, history, achievements, help, duo, predict10, predictions];
 const commandCollection = new Collection();
 for (const cmd of commands) {
   commandCollection.set(cmd.data.name, cmd);
@@ -287,6 +288,16 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: '🔒 Betting is closed for this match.', ephemeral: true });
       }
 
+      // Parlay is a side-bet — you have to take a position on the match
+      // (WIN or LOSE) before you can stack legs on top of it. This prevents
+      // people from cherry-picking parlays without committing to the match.
+      if (!getUserBetOnMatch(interaction.guildId, interaction.user.id, matchId)) {
+        return interaction.reply({
+          content: '🎰 Place a 🟢 **WIN** or 🔴 **LOSE** bet on this match first — parlay is a side-bet, not a substitute.',
+          ephemeral: true,
+        });
+      }
+
       const parlayLegs = getMatchParlay(interaction.guildId, matchId);
       if (!parlayLegs || parlayLegs.length === 0) {
         return interaction.reply({ content: '❌ No parlay available for this match.', ephemeral: true });
@@ -490,6 +501,15 @@ client.on('interactionCreate', async (interaction) => {
       const match = getActiveMatchByMatchId(guildId, matchId);
       if (!match) {
         return interaction.reply({ content: '❌ This match is no longer active.', ephemeral: true });
+      }
+
+      // Re-check the base-bet gate at submit time — covers the edge case
+      // where someone opens the modal first, then deletes/swaps their bet.
+      if (!getUserBetOnMatch(guildId, userId, matchId)) {
+        return interaction.reply({
+          content: '🎰 Place a 🟢 **WIN** or 🔴 **LOSE** bet on this match first — parlay is a side-bet, not a substitute.',
+          ephemeral: true,
+        });
       }
 
       const parlayLegs = getMatchParlay(guildId, matchId);

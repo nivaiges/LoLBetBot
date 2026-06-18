@@ -21,4 +21,9 @@ saved-graphs/
 
 # Runtime asset caches (auto-downloaded by the bot)
 assets/champions/
+assets/profile-icons/
+assets/ranks/
+assets/ranks-mini/
+assets/lanes/
+assets/splash/
 data/

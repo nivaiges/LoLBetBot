@@ -1,6 +1,6 @@
 import { SlashCommandBuilder } from 'discord.js';
 import { addTrackedPlayer, getTrackedPlayerByTag } from '../db.js';
-import { getAccountByRiotId } from '../riot.js';
+import { getAccountByRiotId, riotRateLimitMessage } from '../riot.js';
 import config from '../../config.js';
 
 export const data = new SlashCommandBuilder()
@@ -32,11 +32,11 @@ export async function execute(interaction) {
   await interaction.deferReply();
 
   const account = await getAccountByRiotId(gameName, tagLine, region);
-  if (!account || account.rateLimited) {
-    const msg = account?.rateLimited
-      ? 'Riot API is rate limited. Try again later.'
-      : `Could not find Riot account **${riotId}**. Check the name and tagline.`;
-    return interaction.editReply(msg);
+  if (account?.rateLimited) {
+    return interaction.editReply(riotRateLimitMessage());
+  }
+  if (!account) {
+    return interaction.editReply(`Could not find Riot account **${riotId}**. Check the name and tagline.`);
   }
 
   addTrackedPlayer(guildId, riotId, account.puuid, region);
