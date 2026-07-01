@@ -141,8 +141,16 @@ function queueName(game) {
 
 // Queue IDs the bot DOESN'T post Match Detected for at all (fully silent).
 const SKIP_QUEUES = new Set([
-  1700, // Arena
-  830, 840, 850, // Co-op vs AI
+  1700, 1710, 1740, // Arena variants (Riot rotates queue IDs per season)
+  830, 840, 850,    // Co-op vs AI
+]);
+
+// Game-mode strings that are always silent regardless of queue ID. Belt-and-
+// suspenders alongside SKIP_QUEUES — if Riot ships a new Arena queue ID we
+// don't know about, the gameMode string ("CHERRY" for Arena) still catches
+// it. Spectator-V5 populates `game.gameMode` from the same LoL client enum.
+const SKIP_GAME_MODES = new Set([
+  'CHERRY', // Arena (2v2v2v2)
 ]);
 
 // Queue IDs that produce a full Match Over recap when they end. Anything
@@ -385,8 +393,9 @@ async function checkForNewMatches() {
     // unknown queues — including the new ranked-5s mode — still post Match
     // Detected so people see the game; they get silently cancelled at the
     // Match Over step instead (see TRACKED_QUEUES check in checkActiveMatches).
-    if (SKIP_QUEUES.has(game.gameQueueConfigId)) {
-      peakLog.info('spectator: skipped queue', { riotTag: player.riot_tag, queue: game.gameQueueConfigId });
+    // gameMode check catches Arena variants Riot may ship under new queue IDs.
+    if (SKIP_QUEUES.has(game.gameQueueConfigId) || SKIP_GAME_MODES.has(game.gameMode)) {
+      peakLog.info('spectator: skipped queue', { riotTag: player.riot_tag, queue: game.gameQueueConfigId, mode: game.gameMode });
       continue;
     }
 
