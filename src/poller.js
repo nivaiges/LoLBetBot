@@ -4,7 +4,7 @@ import logger from './utils/logger.js';
 import { fileLog } from './utils/fileLog.js';
 import { peakLog } from './utils/peakLog.js';
 import { getActiveGame, getMatchResult, getMatchTimeline, getRankedStatsByPuuid, loadChampionMap, getChampionName, getChampionInternalId } from './riot.js';
-import { computeTeamGoldLead, extractObjectiveEvents, computeWonLane, extractTrackedPlayerKills, renderTeamsCompositePng, renderMatchOverPng } from './matchGraph.js';
+import { computeTeamGoldLead, extractObjectiveEvents, computeWonLane, extractTrackedPlayerKills, renderTeamsCompositePng, renderMatchOverPng, renderMatchOverScoreboardPng, renderMatchOverImpactPng } from './matchGraph.js';
 import { loadPlayRates, inferLanes } from './utils/laneInfer.js';
 import { registerBettingWindow } from './utils/bettingwindow.js';
 import {
@@ -139,10 +139,29 @@ function queueName(game) {
   return QUEUE_NAMES[game?.gameQueueConfigId] || game?.gameMode || 'Custom';
 }
 
-// Queue IDs we deliberately don't post Match Detected / Match Over for.
+// Queue IDs the bot DOESN'T post Match Detected for at all (fully silent).
 const SKIP_QUEUES = new Set([
   1700, // Arena
   830, 840, 850, // Co-op vs AI
+]);
+
+// Queue IDs that produce a full Match Over recap when they end. Anything
+// detected but NOT in this allowlist (e.g. the new ranked-5s mode) still
+// posts Match Detected so people see the game starting, but at match end
+// the result is silently cancelled — Match Detected gets deleted, any bets
+// refunded, no Match Over post.
+const TRACKED_QUEUES = new Set([
+  400,  // Normal Draft
+  420,  // Ranked Solo/Duo
+  430,  // Normal Blind
+  440,  // Ranked Flex
+  450,  // ARAM
+  490,  // Quickplay
+  700,  // Clash
+  720,  // ARAM Clash
+  900,  // ARURF
+  1020, // One for All
+  1900, // URF
 ]);
 
 // Parlay pool. Each leg has:
@@ -362,7 +381,10 @@ async function checkForNewMatches() {
 
     const matchId = `${player.region.toUpperCase()}_${game.gameId}`;
 
-    // Skip game modes we don't want to track (e.g. Arena, Co-op vs AI).
+    // Hard-skip queues that should never post (Arena, Co-op vs AI). Other
+    // unknown queues — including the new ranked-5s mode — still post Match
+    // Detected so people see the game; they get silently cancelled at the
+    // Match Over step instead (see TRACKED_QUEUES check in checkActiveMatches).
     if (SKIP_QUEUES.has(game.gameQueueConfigId)) {
       peakLog.info('spectator: skipped queue', { riotTag: player.riot_tag, queue: game.gameQueueConfigId });
       continue;
@@ -423,8 +445,9 @@ async function checkForNewMatches() {
       // API order when inference is unavailable (no play-rate data, missing
       // champions, etc.).
       const orderByLane = (team) => {
-        const ids = team.map(p => p.championId);
-        const lanes = inferLanes(ids);
+        // Pass full participant objects so inferLanes can hard-pin the
+        // smite-carrier to JUNGLE (smite is matchmaker-restricted to jng).
+        const lanes = inferLanes(team);
         if (!lanes) return team;
         const ordered = [];
         for (const pos of ['TOP', 'JUNGLE', 'MIDDLE', 'BOTTOM', 'UTILITY']) {
@@ -449,7 +472,7 @@ async function checkForNewMatches() {
         parlayLegs = existingParlay;
       } else if (Math.random() < config.parleyChance) {
         const trackedTeam = trackedTeamId === 100 ? blueTeam : redTeam;
-        const trackedLanes = inferLanes(trackedTeam.map(p => p.championId));
+        const trackedLanes = inferLanes(trackedTeam);
         let trackedRole = 'MIDDLE'; // safe default if inference fails
         if (trackedLanes) {
           for (const pos of ['TOP', 'JUNGLE', 'MIDDLE', 'BOTTOM', 'UTILITY']) {
@@ -732,6 +755,27 @@ async function checkActiveMatches() {
         .setColor(0x95a5a6)
         .setTimestamp();
       sendToGuild(first.guild_id, { embeds: [embed] });
+      continue;
+    }
+
+    // Silent cancel for queues that aren't in TRACKED_QUEUES — e.g. the new
+    // ranked-5s mode. Match Detected already posted, but we skip Match Over
+    // entirely: refund bets, delete the Match Detected message, no notice.
+    const matchQueueId = result.info?.queueId;
+    if (matchQueueId != null && !TRACKED_QUEUES.has(matchQueueId)) {
+      logger.info({ matchId: first.match_id, guildId: first.guild_id, queueId: matchQueueId }, 'Untracked queue, silently cancelling match');
+      markMatchCancelled(first.guild_id, first.match_id);
+      uggUrlByMatch.delete(first.match_id);
+      cancelUnresolvedBets(first.guild_id, first.match_id);
+      for (const row of rows) {
+        const msgs = getMatchMessages(row.guild_id, row.puuid, row.match_id);
+        if (msgs) {
+          await deleteGuildMessage(row.guild_id, msgs.message_id);
+          await deleteGuildMessage(row.guild_id, msgs.close_message_id);
+        }
+        const extras = getActiveMatchExtraMessages(row.guild_id, row.puuid, row.match_id);
+        for (const id of extras) await deleteGuildMessage(row.guild_id, id);
+      }
       continue;
     }
 
@@ -1100,6 +1144,9 @@ async function checkActiveMatches() {
           name: p.playerName, championId: p.championId, champName: p.champName,
           k: p.k, d: p.d, a: p.a, kda: p.kda, cs: p.cs, dmg: p.dmg, kp: p.kp,
           dailyW: daily.wins, dailyL: daily.losses, wonLane: p.wonLane, laneDiff: p.laneDiff,
+          // Per-player win flag — duos on opposite teams render correctly
+          // when each card pulls its own W/L color.
+          won: p.won,
         };
       });
 
@@ -1129,10 +1176,38 @@ async function checkActiveMatches() {
         lead, objectives, kills,
       });
 
+      // Full-lobby scoreboard panel — sent as a second attachment so Discord
+      // lays it out next to the splash recap. Pulls every per-participant
+      // stat straight from the Match-V5 response (no derived fields).
+      const blueTeamMatch = (result.info?.participants || []).filter(p => p.teamId === 100);
+      const redTeamMatch  = (result.info?.participants || []).filter(p => p.teamId === 200);
+      const scoreboardPng = (blueTeamMatch.length && redTeamMatch.length)
+        ? await renderMatchOverScoreboardPng({
+            blueTeam: blueTeamMatch,
+            redTeam: redTeamMatch,
+            trackedPuuid: primaryPlayer.puuid,
+            durationStr,
+            getChampionInternalId,
+            getChampionName,
+          })
+        : null;
+      const impactPng = (blueTeamMatch.length && redTeamMatch.length)
+        ? await renderMatchOverImpactPng({
+            blueTeam: blueTeamMatch,
+            redTeam: redTeamMatch,
+            trackedPuuid: primaryPlayer.puuid,
+            getChampionInternalId,
+            getChampionName,
+          })
+        : null;
+
       let sendPayload;
       if (matchOverPng) {
+        const files = [{ attachment: matchOverPng, name: 'match-over.png' }];
+        if (scoreboardPng) files.push({ attachment: scoreboardPng, name: 'scoreboard.png' });
+        if (impactPng) files.push({ attachment: impactPng, name: 'impact.png' });
         sendPayload = {
-          files: [{ attachment: matchOverPng, name: 'match-over.png' }],
+          files,
           // Keep in Chat button — gated by saveGraphAllowedUserIds in the handler.
           components: [
             new ActionRowBuilder().addComponents(

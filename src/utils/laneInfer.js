@@ -68,17 +68,39 @@ function parseMerakiPayload(j) {
   return out;
 }
 
-// `championIds` must be exactly 5 numbers. Returns:
-//   { TOP, JUNGLE, MIDDLE, BOTTOM, UTILITY } → championId
-// or null if play rates haven't loaded or input is malformed.
-export function inferLanes(championIds) {
-  if (!playRates || !Array.isArray(championIds) || championIds.length !== 5) return null;
+// Smite summoner spell ID. The matchmaker only allows it in the jungle slot,
+// so whoever brought smite is the jungler with 100% certainty — we pin them
+// to JUNGLE and let the play-rate optimizer fill the other four positions.
+const SMITE_ID = 11;
+
+function hasSmite(p) {
+  return p?.spell1Id    === SMITE_ID || p?.spell2Id    === SMITE_ID
+      || p?.summoner1Id === SMITE_ID || p?.summoner2Id === SMITE_ID;
+}
+
+// Input can be either:
+//   - 5 numbers  (legacy: just champion IDs, no smite hint)
+//   - 5 objects  ({ championId, spell1Id, spell2Id } from Spectator-V5, or
+//                  { championId, summoner1Id, summoner2Id } from Match-V5)
+// Returns: { TOP, JUNGLE, MIDDLE, BOTTOM, UTILITY } → championId, or null.
+export function inferLanes(participants) {
+  if (!playRates || !Array.isArray(participants) || participants.length !== 5) return null;
+
+  const isObject = typeof participants[0] === 'object' && participants[0] !== null;
+  const champs = isObject ? participants.map(p => p.championId) : participants;
+
+  // Smite hard-pin — only when caller passed participant objects. Lock that
+  // champion into the JUNGLE slot; skip any permutation that violates it.
+  let smiteChampId = null;
+  if (isObject) {
+    const smiter = participants.find(hasSmite);
+    if (smiter) smiteChampId = smiter.championId;
+  }
 
   let best = null;
   let bestScore = -Infinity;
-
-  // 5! = 120 permutations
-  for (const perm of permute(championIds)) {
+  for (const perm of permute(champs)) {
+    if (smiteChampId != null && perm[1] !== smiteChampId) continue;
     let score = 0;
     for (let i = 0; i < POSITIONS.length; i++) {
       score += playRates[perm[i]]?.[POSITIONS[i]] ?? 0;

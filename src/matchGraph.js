@@ -9,6 +9,8 @@ import { getProfileIcon } from './utils/profileIcons.js';
 import { getRankEmblem, getRankMiniCrest } from './utils/rankEmblems.js';
 import { getLaneIcon } from './utils/laneIcons.js';
 import { getChampionSplash } from './utils/championSplash.js';
+import { getItemIcon } from './utils/itemIcons.js';
+import { getSummonerSpellIcon, getRuneIcon, getRuneStyleIcon } from './utils/runeIcons.js';
 
 // Asset-loader for objective icons. Drop PNGs (≈18×18) in assets/objectives/
 // named after the kind in lowercase (baron.png, herald.png, grubs.png,
@@ -3006,7 +3008,7 @@ export async function renderTeamsCompositePng(opts = {}) {
 // the stats stay legible), then BETS SETTLED / PARLAY / ACHIEVEMENTS /
 // GOLD GRAPH render as separate cards below.
 async function renderMatchOverSplashPng({
-  won, durationStr, player,
+  won, durationStr, players,
   getChampionInternalId,
   bets, parlay, achievements,
   lead, objectives, kills,
@@ -3016,7 +3018,11 @@ async function renderMatchOverSplashPng({
   const WHITE = '#ffffff';
   const GREY = '#b5bac1';
   const SUBTLE = '#80848e';
+  // Header chip + outer accents follow the primary tracked player's W/L —
+  // matches the existing splash card behavior. Duo on a split team is an
+  // edge case (each card still recolors itself per-player below).
   const accent = won ? WIN : LOSE;
+  if (!Array.isArray(players) || !players.length) return null;
 
   try {
     const SCALE = 2;
@@ -3044,7 +3050,10 @@ async function renderMatchOverSplashPng({
 
     // ── Section heights ────────────────────────────────────────────────────
     const headerH = 84;
+    // Each tracked player gets their own splash card; duo = 2 cards stacked.
     const playerCardH = 220;
+    const playerCardGap = 12;
+    const playersBlockH = players.length * playerCardH + Math.max(0, players.length - 1) * playerCardGap;
     const sectionGap = 12;
 
     const lineH = 26;
@@ -3065,7 +3074,7 @@ async function renderMatchOverSplashPng({
     const totalGapAfterSections = sectionsTotal * sectionGap;
 
     const padBottom = 16;
-    const H = headerH + sectionGap + playerCardH + totalGapAfterSections + betsH + parlayH + chartCardH + padBottom;
+    const H = headerH + sectionGap + playersBlockH + totalGapAfterSections + betsH + parlayH + chartCardH + padBottom;
 
     const canvas = createCanvas(W * SCALE, H * SCALE);
     const ctx = canvas.getContext('2d');
@@ -3129,13 +3138,22 @@ async function renderMatchOverSplashPng({
       ctx.fillText(durationStr, chipX + chipW + 14, chipY + chipH / 2);
     }
 
-    // ── PLAYER CARD ────────────────────────────────────────────────────────
+    // ── PLAYER CARDS ──────────────────────────────────────────────────────
+    // One splash card per tracked player. Each card pulls its own win/lose
+    // from `player.won` so a split-team duo still colors per-player correctly.
     const playerCardY = headerH + sectionGap;
     const playerCardW = W - padX * 2;
-    await drawPlayerSplashCard({
-      ctx, x: padX, y: playerCardY, w: playerCardW, h: playerCardH,
-      player, accent, won, getChampionInternalId, WIN, LOSE,
-    });
+    for (let pi = 0; pi < players.length; pi++) {
+      const cardY = playerCardY + pi * (playerCardH + playerCardGap);
+      const playerObj = players[pi];
+      const playerWon = playerObj.won !== undefined ? playerObj.won : won;
+      const playerAccent = playerWon ? WIN : LOSE;
+      await drawPlayerSplashCard({
+        ctx, x: padX, y: cardY, w: playerCardW, h: playerCardH,
+        player: playerObj, accent: playerAccent, won: playerWon,
+        getChampionInternalId, WIN, LOSE,
+      });
+    }
 
     // ── HELPERS: card rendering ────────────────────────────────────────────
     const drawCard = (y, h, label, accentColor) => {
@@ -3186,7 +3204,7 @@ async function renderMatchOverSplashPng({
       ctx.fillText(stripped, iconX + iconSize + 10, lineY - 8);
     };
 
-    let cy = playerCardY + playerCardH + sectionGap;
+    let cy = playerCardY + playersBlockH + sectionGap;
 
     if (bets.length) {
       drawCard(cy, betsH, '🏛  BETS SETTLED', '#cfd6ff');
@@ -3434,6 +3452,582 @@ function formatNumber(n) {
   return String(n);
 }
 
+// Full 10-player scoreboard panel for Match Over — meant to be attached
+// alongside the splash recap so Discord lays them out side-by-side. Each
+// row shows: champion icon, summoner name + champ name, K/D/A, CS, DMG,
+// KP%, Gold, and the 7 item slots from the participant. The tracked
+// player's row gets the gold-ring highlight used elsewhere.
+//
+// Inputs come straight from Match-V5 participants (no derived fields
+// required) — caller passes the blue/red participant arrays and the
+// puuid of the tracked player to highlight.
+// Triple-bar "impact" chart — 10 player slots in two team-grouped clusters,
+// each slot showing three small vertical bars: damage dealt to champions,
+// CC score (timeCCingOthers in seconds), and vision score. All three bars
+// are normalized to the lobby max for that metric, so the tallest bar in
+// each color flags the leader. Designed to live in the bottom-right of the
+// Match Over Discord message, next to the scoreboard above it.
+export async function renderMatchOverImpactPng(opts = {}) {
+  const {
+    blueTeam = [],
+    redTeam = [],
+    trackedPuuid = null,
+    getChampionInternalId,
+    getChampionName,
+  } = opts;
+
+  if (!blueTeam.length || !redTeam.length || !getChampionInternalId) return null;
+
+  const BLUE = '#5DADE2';
+  const RED  = '#e74c3c';
+  const WHITE = '#ffffff';
+  const SUBTLE = '#80848e';
+
+  // Bar colors — distinct hue per metric so all three read at a glance.
+  const DMG_COLOR    = '#f0b232'; // amber — damage
+  const CC_COLOR     = '#9b59b6'; // purple — control
+  const VISION_COLOR = '#3cbec8'; // cyan — vision/wards
+
+  try {
+    const SCALE = 2;
+    const W = 980;
+    const padX = 20;
+
+    const titleH    = 50;
+    const legendH   = 32;
+    const plotH     = 230;
+    const footerH   = 80;  // champ icon + name + role
+    const padBottom = 18;
+    const H = titleH + legendH + plotH + footerH + padBottom;
+
+    const canvas = createCanvas(W * SCALE, H * SCALE);
+    const ctx = canvas.getContext('2d');
+    ctx.scale(SCALE, SCALE);
+
+    // Backdrop
+    const bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, '#0c0f17');
+    bg.addColorStop(1, '#06080d');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+
+    // ── Title ──────────────────────────────────────────────────────────────
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = WHITE;
+    ctx.font = `900 26px ${FONT_STACK}`;
+    ctx.fillText('IMPACT', padX, 34);
+
+    // Combined player list with team color + computed metrics
+    const all = [
+      ...blueTeam.map(p => ({ p, team: 'blue', color: BLUE })),
+      ...redTeam.map (p => ({ p, team: 'red',  color: RED  })),
+    ];
+    const metricsFor = (p) => ({
+      dmg:    p.totalDamageDealtToChampions || 0,
+      cc:     Math.round(p.timeCCingOthers || 0),
+      vision: p.visionScore || 0,
+    });
+    const stats = all.map(x => metricsFor(x.p));
+    const dmgMax    = Math.max(1, ...stats.map(s => s.dmg));
+    const ccMax     = Math.max(1, ...stats.map(s => s.cc));
+    const visionMax = Math.max(1, ...stats.map(s => s.vision));
+    const dmgLeader    = stats.findIndex(s => s.dmg    === dmgMax);
+    const ccLeader     = stats.findIndex(s => s.cc     === ccMax);
+    const visionLeader = stats.findIndex(s => s.vision === visionMax);
+
+    // ── Legend ────────────────────────────────────────────────────────────
+    {
+      const y = titleH + 16;
+      const pip = (lx, color, text) => {
+        ctx.fillStyle = color;
+        roundRect(ctx, lx, y - 8, 14, 14, 3);
+        ctx.fill();
+        ctx.fillStyle = WHITE;
+        ctx.font = `bold 13px ${FONT_STACK}`;
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'left';
+        ctx.fillText(text, lx + 20, y - 1);
+        return ctx.measureText(text).width + 20 + 18;
+      };
+      let lx = padX;
+      lx += pip(lx, DMG_COLOR,    'Damage');
+      lx += pip(lx, CC_COLOR,     'CC Score');
+      lx += pip(lx, VISION_COLOR, 'Vision Score');
+    }
+
+    // ── Plot area ──────────────────────────────────────────────────────────
+    const plotY = titleH + legendH;
+    const usable = W - padX * 2;
+    const teamGap = 28;
+    const slotW = (usable - teamGap) / 10;
+    const barW = 14;
+    const barGap = 3;
+    const triplet = barW * 3 + barGap * 2;
+    const tripletInset = (slotW - triplet) / 2;
+    const baseY = plotY + plotH - 6; // bars grow upward from this baseline
+    const barMaxH = plotH - 22;       // leave room for value labels above
+
+    // Subtle horizontal grid (4 ticks)
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const gy = baseY - (barMaxH * i) / 4;
+      ctx.beginPath();
+      ctx.moveTo(padX, gy);
+      ctx.lineTo(W - padX, gy);
+      ctx.stroke();
+    }
+
+    // Team divider in the middle
+    const dividerX = padX + 5 * slotW + teamGap / 2;
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(dividerX, plotY);
+    ctx.lineTo(dividerX, baseY + 12);
+    ctx.stroke();
+
+    // Team labels above the plot at the left/right edges
+    ctx.font = `900 12px ${FONT_STACK}`;
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = BLUE;
+    ctx.textAlign = 'left';
+    ctx.fillText('◆ BLUE', padX, plotY + 14);
+    ctx.fillStyle = RED;
+    ctx.textAlign = 'right';
+    ctx.fillText('RED ◆', W - padX, plotY + 14);
+
+    // ── Per-slot rendering ────────────────────────────────────────────────
+    for (let i = 0; i < all.length; i++) {
+      const { p, team, color } = all[i];
+      const s = stats[i];
+      const isTracked = p.puuid === trackedPuuid;
+
+      // Slot X — blue 0..4 in left half, red 5..9 in right half (after gap)
+      const teamIdx = team === 'blue' ? i : (i - 5);
+      const slotX = padX + (team === 'blue' ? teamIdx * slotW : (5 * slotW + teamGap) + teamIdx * slotW);
+
+      // Tracked-player accent — a soft gold column behind the bars
+      if (isTracked) {
+        ctx.fillStyle = 'rgba(240,178,50,0.10)';
+        roundRect(ctx, slotX + 2, plotY + 6, slotW - 4, plotH + footerH - 16, 8);
+        ctx.fill();
+        ctx.save();
+        ctx.strokeStyle = '#f0b232';
+        ctx.globalAlpha = 0.5;
+        ctx.lineWidth = 1.2;
+        roundRect(ctx, slotX + 2.5, plotY + 6.5, slotW - 5, plotH + footerH - 17, 8);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Three bars
+      const bars = [
+        { val: s.dmg,    max: dmgMax,    color: DMG_COLOR,    isLeader: i === dmgLeader,    label: formatNumber(s.dmg) },
+        { val: s.cc,     max: ccMax,     color: CC_COLOR,     isLeader: i === ccLeader,     label: String(s.cc) },
+        { val: s.vision, max: visionMax, color: VISION_COLOR, isLeader: i === visionLeader, label: String(s.vision) },
+      ];
+      for (let b = 0; b < 3; b++) {
+        const bar = bars[b];
+        const bx = slotX + tripletInset + b * (barW + barGap);
+        const frac = bar.val / bar.max;
+        const bh = Math.max(2, frac * barMaxH);
+        const by = baseY - bh;
+
+        // Bar track (faint background)
+        ctx.fillStyle = 'rgba(255,255,255,0.05)';
+        roundRect(ctx, bx, baseY - barMaxH, barW, barMaxH, 2);
+        ctx.fill();
+        // Bar fill
+        ctx.fillStyle = bar.color;
+        roundRect(ctx, bx, by, barW, bh, 2);
+        ctx.fill();
+        // Leader marker — small gold downward triangle above the bar, drawn
+        // as a path so we don't depend on the host font for glyphs. Sits
+        // above the value label.
+        if (bar.isLeader) {
+          const cxArrow = bx + barW / 2;
+          const tipY = by - 17;
+          ctx.fillStyle = '#f0b232';
+          ctx.beginPath();
+          ctx.moveTo(cxArrow - 5, tipY - 7);
+          ctx.lineTo(cxArrow + 5, tipY - 7);
+          ctx.lineTo(cxArrow,     tipY);
+          ctx.closePath();
+          ctx.fill();
+        }
+        // Value label above the bar (small, faint)
+        ctx.fillStyle = isTracked ? '#f0b232' : SUBTLE;
+        ctx.font = `bold 9px ${FONT_STACK}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'alphabetic';
+        ctx.fillText(bar.label, bx + barW / 2, by - 3);
+      }
+
+      // ── Footer per slot — champion icon, player name, role ──────────────
+      const footerTopY = plotY + plotH + 8;
+      const champCx = slotX + slotW / 2;
+      const champR = 22;
+      const champCy = footerTopY + champR;
+      const internalId = getChampionInternalId(p.championId);
+      const champIcon = internalId ? await getChampionIcon(internalId) : null;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(champCx, champCy, champR, 0, Math.PI * 2);
+      ctx.clip();
+      if (champIcon) ctx.drawImage(champIcon, champCx - champR, champCy - champR, champR * 2, champR * 2);
+      else { ctx.fillStyle = '#2a2e38'; ctx.fillRect(champCx - champR, champCy - champR, champR * 2, champR * 2); }
+      ctx.restore();
+      ctx.strokeStyle = isTracked ? '#f0b232' : color;
+      ctx.lineWidth = isTracked ? 2 : 1.5;
+      ctx.beginPath();
+      ctx.arc(champCx, champCy, champR - 0.5, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Player name below the avatar
+      const name = p.riotIdGameName || p.summonerName || '—';
+      const short = name.length > 11 ? name.slice(0, 10) + '…' : name;
+      ctx.fillStyle = isTracked ? '#f0b232' : WHITE;
+      ctx.font = `${isTracked ? 'italic ' : ''}bold 11px ${FONT_STACK}`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText(short, champCx, champCy + champR + 6);
+    }
+
+    return canvas.toBuffer('image/png');
+  } catch (err) {
+    logger.warn({ err: err.message }, 'matchGraph: impact chart render failed');
+    return null;
+  }
+}
+
+export async function renderMatchOverScoreboardPng(opts = {}) {
+  const {
+    blueTeam = [],
+    redTeam = [],
+    trackedPuuid = null,
+    durationStr = '',
+    getChampionInternalId,
+    getChampionName,
+  } = opts;
+
+  if (!blueTeam.length || !redTeam.length || !getChampionInternalId || !getChampionName) return null;
+
+  const BLUE = '#5DADE2';
+  const RED  = '#e74c3c';
+  const WIN  = '#3ba55d';
+  const LOSE = '#ed4245';
+  const WHITE = '#ffffff';
+  const GREY = '#9aa0a6';
+  const SUBTLE = '#80848e';
+
+  try {
+    const SCALE = 2;
+    const W = 980;
+    const padX = 20;
+
+    const titleH = 50;
+    const colHeaderH = 26;
+    const teamHdrH = 30;
+    const rowH = 56;
+    const teamGap = 14;
+    const padBottom = 20;
+    const H = titleH + colHeaderH + teamHdrH + 5 * rowH + teamGap + teamHdrH + 5 * rowH + padBottom;
+
+    const canvas = createCanvas(W * SCALE, H * SCALE);
+    const ctx = canvas.getContext('2d');
+    ctx.scale(SCALE, SCALE);
+
+    // Backdrop
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+    bgGrad.addColorStop(0, '#0c0f17');
+    bgGrad.addColorStop(1, '#06080d');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    // ── Header ────────────────────────────────────────────────────────────
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = WHITE;
+    ctx.font = `900 26px ${FONT_STACK}`;
+    ctx.fillText('SCOREBOARD', padX, 34);
+    if (durationStr) {
+      ctx.textAlign = 'right'; ctx.fillStyle = SUBTLE;
+      ctx.font = `bold 14px ${FONT_STACK}`;
+      ctx.fillText(durationStr, W - padX, 34);
+    }
+
+    // ── Column anchors (used by both team sections) ──────────────────────
+    // Leftmost three columns are stacked icon pairs: rune (keystone + path),
+    // summoner spells (D + F), then the champion avatar. Player text begins
+    // after the avatar.
+    const RUNE_COL_X  = padX + 4;
+    const RUNE_BOX    = 22;
+    const SUMM_COL_X  = RUNE_COL_X + RUNE_BOX + 4;
+    const SUMM_BOX    = 22;
+    const CHAMP_COL_X = SUMM_COL_X + SUMM_BOX + 6;
+    const CHAMP_R     = 20;
+    const COL = {
+      playerX:  CHAMP_COL_X + CHAMP_R * 2 + 12,
+      kdaX:     padX + 352,
+      csX:      padX + 456,
+      dmgX:     padX + 530,
+      kpX:      padX + 602,
+      goldX:    padX + 670,
+      itemsX:   padX + 722,
+    };
+    const ITEM_SIZE = 30;
+    const ITEM_GAP  = 1;
+
+    // Column header strip
+    {
+      const y = titleH;
+      ctx.fillStyle = '#10141d';
+      roundRect(ctx, padX, y, W - padX * 2, colHeaderH, 6);
+      ctx.fill();
+      ctx.fillStyle = SUBTLE;
+      ctx.font = `bold 11px ${FONT_STACK}`;
+      ctx.textBaseline = 'middle';
+      const labelY = y + colHeaderH / 2 + 1;
+      ctx.textAlign = 'left';
+      ctx.fillText('PLAYER', COL.playerX, labelY);
+      ctx.textAlign = 'center';
+      ctx.fillText('K / D / A', COL.kdaX, labelY);
+      ctx.fillText('CS',  COL.csX,  labelY);
+      ctx.fillText('DMG', COL.dmgX, labelY);
+      ctx.fillText('KP',  COL.kpX,  labelY);
+      ctx.fillText('GOLD',COL.goldX,labelY);
+      ctx.textAlign = 'left';
+      ctx.fillText('ITEMS', COL.itemsX, labelY);
+    }
+
+    // ── Team section drawer ──────────────────────────────────────────────
+    const drawTeam = async (team, teamLabel, teamColor, sectionY) => {
+      // Team header bar
+      const teamWon = team[0]?.win === true;
+      ctx.fillStyle = '#10141d';
+      roundRect(ctx, padX, sectionY, W - padX * 2, teamHdrH, 6);
+      ctx.fill();
+      ctx.save();
+      ctx.strokeStyle = teamColor;
+      ctx.globalAlpha = 0.45;
+      ctx.lineWidth = 1.2;
+      roundRect(ctx, padX + 0.5, sectionY + 0.5, W - padX * 2 - 1, teamHdrH - 1, 6);
+      ctx.stroke();
+      ctx.restore();
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = teamColor;
+      ctx.font = `900 14px ${FONT_STACK}`;
+      ctx.fillText(`◆  ${teamLabel} TEAM`, padX + 12, sectionY + teamHdrH / 2 + 1);
+      // WIN/LOSE pill on the right
+      const pillText = teamWon ? 'WIN' : 'LOSE';
+      const pillColor = teamWon ? WIN : LOSE;
+      ctx.font = `900 12px ${FONT_STACK}`;
+      const pillTw = ctx.measureText(pillText).width;
+      const pillW = pillTw + 18;
+      const pillH = 20;
+      const pillX = W - padX - 12 - pillW;
+      const pillY = sectionY + (teamHdrH - pillH) / 2;
+      ctx.fillStyle = hexWithAlpha(pillColor, 0.20);
+      roundRect(ctx, pillX, pillY, pillW, pillH, pillH / 2);
+      ctx.fill();
+      ctx.save();
+      ctx.strokeStyle = pillColor;
+      ctx.globalAlpha = 0.85;
+      ctx.lineWidth = 1.2;
+      roundRect(ctx, pillX + 0.5, pillY + 0.5, pillW - 1, pillH - 1, pillH / 2);
+      ctx.stroke();
+      ctx.restore();
+      ctx.fillStyle = pillColor;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(pillText, pillX + pillW / 2, pillY + pillH / 2 + 1);
+
+      // Team total kills — used for KP%
+      const teamKills = team.reduce((s, p) => s + (p.kills || 0), 0);
+
+      // Player rows
+      for (let i = 0; i < team.length; i++) {
+        const p = team[i];
+        const rowY = sectionY + teamHdrH + i * rowH;
+        const isTracked = p.puuid === trackedPuuid;
+
+        // Row background — alternating subtle stripe, tracked gets accent.
+        ctx.fillStyle = i % 2 === 0 ? '#10141d' : '#0e121b';
+        roundRect(ctx, padX, rowY, W - padX * 2, rowH - 2, 6);
+        ctx.fill();
+        if (isTracked) {
+          ctx.save();
+          ctx.strokeStyle = '#f0b232';
+          ctx.globalAlpha = 0.55;
+          ctx.lineWidth = 1.5;
+          roundRect(ctx, padX + 0.5, rowY + 0.5, W - padX * 2 - 1, rowH - 3, 6);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        const iconCy = rowY + (rowH - 2) / 2;
+
+        // ── Rune column — keystone (primary) on top, secondary path under
+        // Riot puts the primary perk at perks.styles[0].selections[0].perk
+        // and the secondary style id at perks.styles[1].style.
+        const primaryPerkId = p.perks?.styles?.[0]?.selections?.[0]?.perk;
+        const secondaryStyleId = p.perks?.styles?.[1]?.style;
+        const drawIconBox = async (loader, idArg, bx, by, sz, bgFill = '#1a1f2b') => {
+          ctx.fillStyle = bgFill;
+          roundRect(ctx, bx, by, sz, sz, 3);
+          ctx.fill();
+          if (!idArg) return;
+          const img = await loader(idArg);
+          if (img) {
+            ctx.save();
+            ctx.beginPath();
+            roundRect(ctx, bx + 1, by + 1, sz - 2, sz - 2, 2);
+            ctx.clip();
+            ctx.drawImage(img, bx + 1, by + 1, sz - 2, sz - 2);
+            ctx.restore();
+          }
+        };
+        const runeTopY = iconCy - RUNE_BOX - 1;
+        const runeBotY = iconCy + 1;
+        await drawIconBox(getRuneIcon,      primaryPerkId,    RUNE_COL_X, runeTopY, RUNE_BOX);
+        await drawIconBox(getRuneStyleIcon, secondaryStyleId, RUNE_COL_X, runeBotY, RUNE_BOX);
+
+        // ── Summoner-spell column ────────────────────────────────────────
+        const summTopY = iconCy - SUMM_BOX - 1;
+        const summBotY = iconCy + 1;
+        await drawIconBox(getSummonerSpellIcon, p.summoner1Id, SUMM_COL_X, summTopY, SUMM_BOX);
+        await drawIconBox(getSummonerSpellIcon, p.summoner2Id, SUMM_COL_X, summBotY, SUMM_BOX);
+
+        // ── Champion icon ────────────────────────────────────────────────
+        const iconR = CHAMP_R;
+        const iconCx = CHAMP_COL_X + iconR;
+        const internalId = getChampionInternalId(p.championId);
+        const icon = internalId ? await getChampionIcon(internalId) : null;
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(iconCx, iconCy, iconR, 0, Math.PI * 2);
+        ctx.clip();
+        if (icon) ctx.drawImage(icon, iconCx - iconR, iconCy - iconR, iconR * 2, iconR * 2);
+        else { ctx.fillStyle = '#2a2e38'; ctx.fillRect(iconCx - iconR, iconCy - iconR, iconR * 2, iconR * 2); }
+        ctx.restore();
+        ctx.strokeStyle = isTracked ? '#f0b232' : teamColor;
+        ctx.lineWidth = isTracked ? 2 : 1.5;
+        ctx.beginPath();
+        ctx.arc(iconCx, iconCy, iconR - 0.5, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // Champion level pip on the lower-right of the avatar
+        if (p.champLevel) {
+          const pipR = 9;
+          const pipX = iconCx + iconR - 4;
+          const pipY = iconCy + iconR - 4;
+          ctx.fillStyle = '#0c0f17';
+          ctx.beginPath();
+          ctx.arc(pipX, pipY, pipR, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = isTracked ? '#f0b232' : teamColor;
+          ctx.lineWidth = 1.2;
+          ctx.stroke();
+          ctx.fillStyle = '#ffffff';
+          ctx.font = `900 10px ${FONT_STACK}`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(String(p.champLevel), pipX, pipY + 1);
+        }
+
+        // Player + champion text
+        const labelX = COL.playerX;
+        const playerName = p.riotIdGameName || p.summonerName || '—';
+        ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+        ctx.fillStyle = isTracked ? '#f0b232' : WHITE;
+        ctx.font = `${isTracked ? 'italic ' : ''}bold 13px ${FONT_STACK}`;
+        const displayName = playerName.length > 14 ? playerName.slice(0, 13) + '…' : playerName;
+        ctx.fillText(displayName, labelX, iconCy - 2);
+        ctx.fillStyle = SUBTLE;
+        ctx.font = `11px ${FONT_STACK}`;
+        const champName = getChampionName(p.championId) || '';
+        ctx.fillText(champName, labelX, iconCy + 14);
+
+        // K / D / A — colored segments
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.font = `bold 14px ${FONT_STACK}`;
+        const kStr = String(p.kills || 0);
+        const dStr = String(p.deaths || 0);
+        const aStr = String(p.assists || 0);
+        const slash = ' / ';
+        const wK = ctx.measureText(kStr).width;
+        const wS = ctx.measureText(slash).width;
+        const wD = ctx.measureText(dStr).width;
+        const wA = ctx.measureText(aStr).width;
+        const total = wK + wD + wA + 2 * wS;
+        let kdaCursor = COL.kdaX - total / 2;
+        ctx.textAlign = 'left';
+        ctx.fillStyle = WIN;
+        ctx.fillText(kStr, kdaCursor, iconCy);   kdaCursor += wK;
+        ctx.fillStyle = SUBTLE;
+        ctx.fillText(slash, kdaCursor, iconCy);  kdaCursor += wS;
+        ctx.fillStyle = LOSE;
+        ctx.fillText(dStr, kdaCursor, iconCy);   kdaCursor += wD;
+        ctx.fillStyle = SUBTLE;
+        ctx.fillText(slash, kdaCursor, iconCy);  kdaCursor += wS;
+        ctx.fillStyle = '#5ad6ff';
+        ctx.fillText(aStr, kdaCursor, iconCy);
+
+        // CS
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillStyle = WHITE;
+        ctx.font = `bold 14px ${FONT_STACK}`;
+        const cs = (p.totalMinionsKilled || 0) + (p.neutralMinionsKilled || 0);
+        ctx.fillText(String(cs), COL.csX, iconCy);
+
+        // DMG
+        const dmg = p.totalDamageDealtToChampions || 0;
+        ctx.fillText(formatNumber(dmg), COL.dmgX, iconCy);
+
+        // KP
+        const kp = teamKills > 0
+          ? Math.round((((p.kills || 0) + (p.assists || 0)) / teamKills) * 100)
+          : 0;
+        ctx.fillText(`${kp}%`, COL.kpX, iconCy);
+
+        // Gold
+        ctx.fillText(formatNumber(p.goldEarned || 0), COL.goldX, iconCy);
+
+        // Items
+        for (let s = 0; s < 7; s++) {
+          const slotX = COL.itemsX + s * (ITEM_SIZE + ITEM_GAP);
+          const slotY = iconCy - ITEM_SIZE / 2;
+          // Empty slot background
+          ctx.fillStyle = '#1a1f2b';
+          roundRect(ctx, slotX, slotY, ITEM_SIZE, ITEM_SIZE, 4);
+          ctx.fill();
+          const itemId = p[`item${s}`] || 0;
+          if (itemId) {
+            const img = await getItemIcon(itemId);
+            if (img) {
+              ctx.save();
+              ctx.beginPath();
+              roundRect(ctx, slotX + 1, slotY + 1, ITEM_SIZE - 2, ITEM_SIZE - 2, 3);
+              ctx.clip();
+              ctx.drawImage(img, slotX + 1, slotY + 1, ITEM_SIZE - 2, ITEM_SIZE - 2);
+              ctx.restore();
+            }
+          }
+        }
+      }
+    };
+
+    let yOff = titleH + colHeaderH;
+    await drawTeam(blueTeam, 'BLUE', BLUE, yOff);
+    yOff += teamHdrH + 5 * rowH + teamGap;
+    await drawTeam(redTeam,  'RED',  RED,  yOff);
+
+    return canvas.toBuffer('image/png');
+  } catch (err) {
+    logger.warn({ err: err.message }, 'matchGraph: scoreboard render failed');
+    return null;
+  }
+}
+
 // Full Match Over recap as a single image: header + per-player cards + bets /
 // parlay / achievements sections + the gold-lead chart embedded at the bottom.
 // All text is rendered (no Discord markdown / mentions), so callers must pass
@@ -3461,16 +4055,16 @@ export async function renderMatchOverPng(opts = {}) {
 
   if (!players.length) return null;
 
-  // Splash-art layout — only used when there's a single tracked player.
-  // Duos fall through to the original compact layout (the splash card needs
-  // too much vertical space to stack two of them comfortably).
-  if (players.length === 1) {
-    return renderMatchOverSplashPng({
-      won, durationStr, player: players[0],
-      getChampionInternalId, bets, parlay, achievements,
-      lead, objectives, kills,
-    });
-  }
+  // Splash-art layout for any number of tracked players. Duos stack two
+  // splash cards inside the same image so the visual language stays
+  // consistent with the single-player case. The legacy compact layout
+  // further below is now a fallback if the splash renderer fails.
+  const splash = await renderMatchOverSplashPng({
+    won, durationStr, players,
+    getChampionInternalId, bets, parlay, achievements,
+    lead, objectives, kills,
+  });
+  if (splash) return splash;
 
   const CARD = '#1e1f22';
   const WHITE = '#ffffff';

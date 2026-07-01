@@ -13,12 +13,15 @@ A Discord bot for betting on friends' League of Legends games using the Riot API
 - `/achievements` — Achievement progress bars
 
 ### Tracked Players
-- `/adduser <GameName#TagLine>` — Add a tracked player
+- `/adduser <GameName#TagLine>` — Add a tracked player (**owner-only**; hard-coded Discord ID gate)
 - `/removeuser <GameName#TagLine>` — Stop tracking
-- `/rank` — Current Solo/Duo ranks of all tracked players + record + peak-recovery distance
+- `/rank` — Rank Ladder card: 9-player ladder sorted by absolute LP, showing tier emblem, current + peak, progress bar to next tier (live Master → GM / GM → Challenger cutoffs), weekly LP delta, and 👑 / 🥀 for first/last place
 - `/peak` — All-time peak Solo/Duo rank per tracked player
 - `/records [season]` — Historical peak ranks from past seasons (populated by `season-reset.js`)
-- `/lp [player]` — **LP history graph** with tier bands, division markers, and win/loss point colors
+- `/lp [player]` — **LP Profile card**: profile icon + level, big rank emblem, faded top-champion splash background, Current/Peak/Win-Rate/Games stat tiles, progress bar with `X LP to <NEXT>`, and an LP-history chart with tier-color line segments (green up / red down) and rank-label Y-axis
+- `/lpc <player1> <player2> ...` — Compare multiple players' LP histories on a single chart
+- `/predict10 [player]` — 10-game win-count prediction (5× / 2× / 0.5× payout based on how close you are)
+- `/predictions` — List your open 10-game predictions
 - `/duo` — Duo W/L records (auto-tracked when two tracked players are on the same team)
 
 ### Betting
@@ -28,39 +31,65 @@ A Discord bot for betting on friends' League of Legends games using the Riot API
 ### Admin / Settings
 - `/bethere` — Set the current channel for betting notifications
 - `/emoji <on|off>` — Toggle rank emoji display
+- `/autodelete <on|off>` — Toggle whether the bot auto-deletes its own Match Detected / Match Over messages on the next match (default ON; turn OFF to keep a running history channel)
 - `/help` — List all commands
 
 ## What the Bot Does Automatically
 
-- **Match detection** — Polls Riot Spectator-V5 every 60 s for tracked players. When one enters a ranked game it posts a Match Detected embed with both team comps, the average lobby rank, and three buttons: 🟢 WIN, 🔴 LOSE, and 🟡 **Auto-bet** (sets up a recurring bet on this player via a modal)
-- **Parlay generation** — ~17.5 % of matches roll a 2- to 4-leg prop bet (over/under or yes/no). Stats: kills, deaths, KDA, CS, vision score, game length, first blood, triple kill, **won lane**. Payout = 2ⁿ for an n-leg parlay
+- **Match detection** — Polls Riot Spectator-V5 every 60 s for tracked players. When one enters a game the bot posts a **Match Detected card** (rendered PNG, no embed): blue/red team panels with champion avatars ringed by the player's tier color, mini-crest rank pill under each name, lane icon overlay, a ban strip per team, and the tracked player highlighted with a gold ring + italic gold name. Duos in the same match get **one shared card** that highlights both partners (not two duplicate posts)
+- **Betting buttons** — 🟢 WIN, 🔴 LOSE, 🟡 **Auto-bet**, and (when available) a 🎰 **Parlay** button. There's also a 🔗 u.gg multisearch link that opens all 10 players side-by-side
+- **Lane inference** — Team composition is ordered TOP → JUNGLE → MIDDLE → BOTTOM → UTILITY via Meraki play-rate optimization; the **smite carrier is hard-pinned to JUNGLE** so meta-flex picks (e.g. jungle Garen) can't be misassigned
+- **Parlay V2** — ~17.5 % of matches roll a 2- to 4-leg prop bet. **Role-aware pool** of 18 legs (kills, deaths, assists, KDA, CS, gold, damage dealt/taken, vision, wards placed/killed, KP%, multi-kills, first blood, triple kill, won lane, win, game length) with per-role line ranges — supports get wards/vision/assists in the right ranges, junglers get elevated kill lines, ADCs get CS but not damage-taken, etc. **Parlay is a side-bet**: you must place a WIN or LOSE first before the parlay modal opens
 - **Auto-bets fire on next match** — Persistent across games until explicitly cleared with `/autobet … clear:True`
-- **5-minute betting window** — Bets close 5 min after match detection; the embed gets edited to "BETTING CLOSED"
+- **The House** — automated rank-skill bettor that places a 1,000 🪙 bet on every match based on team-average LP delta; confidence % shown on the bet line
+- **5-minute betting window** — Bets close 5 min after match detection; buttons are stripped (or the whole Match Detected message replaced, depending on `/autodelete`)
 - **Remake handling** — Riot's `gameEndedInEarlySurrender` flag triggers a full bet refund with no W/L recorded
+- **Untracked-queue silent cancel** — Only Solo/Duo, Flex, Norms, ARAM, Clash, Quickplay, ARURF, OFA, URF are treated as "real" matches. Anything else (e.g. new ranked-5s mode Riot ships mid-season) still posts Match Detected so people see the game, but at match end the bot silently refunds bets and deletes the message — no Match Over post, no W/L recorded
 - **Auto-settle bets** — On match end the bot calls Match-V5, calculates payouts (WIN pays 1.5×, LOSE pays 3×, parlay pays 2ⁿ), updates user stats and achievements
 - **Daily W/L** — Match results show the player's today's record, with 🔥 when above 50 %. Resets at local midnight (not UTC)
-- **Won lane** — At match end, the bot compares gold@14 vs the role opponent and increments `lane_wins` / `lane_losses` per tracked player. Shown in Match Over as 🛣️ Won Lane / Lost Lane
+- **Won lane** — At match end, the bot compares gold@14 vs the role opponent and increments `lane_wins` / `lane_losses` per tracked player. Shown in Match Over as ✓ Won Lane / ✕ Lost Lane with the gold-diff number
 - **Peak rank tracking** — Updates after every match; `/rank` shows distance from peak
+- **Rate-limit handling** — Global semaphore caps in-flight Riot requests at 10; 429 responses trigger auto-retry with `Retry-After` sleep + a shared cooldown so other in-flight requests short-circuit until Riot recovers. Commands surface a canonical "⏳ Riot API is rate-limiting us" message when hit
+- **Apex-tier cutoffs** — Master/GM/Challenger promotion thresholds are computed from the live ladder (top 300 → Challenger, next 700 → GM). Fetches Master + GM + Challenger endpoints (~2 MB total) once per region and caches for 6 hours; used by `/rank` and `/lp` to show accurate "X LP to Grandmaster" text
 
-### Match Over Gold Chart
+### Match Over — 3-panel layout
 
-Every Match Over message comes with a 520×200 PNG chart of the **team gold lead** over time:
+Every Match Over message ships **three attachments** that Discord auto-arranges as one big-on-left + two-stacked-on-right grid:
 
-- **Single line** with blue area-fill where the team was ahead, red where they were behind, switching at the y = 0 crossing
-- **Peak callouts** — pill labels for max lead and max deficit (`+5.4k @ 22m` / `-2.8k @ 8m`)
-- **Objective pins** — real Riot minimap icons (loaded from `assets/objectives/`) for **Baron**, **Rift Herald**, **Void Grubs**, **all six elemental dragons** (Ocean / Mountain / Cloud / Infernal / Hextech / Chemtech), and **Dragon Soul** (the 4th elemental of a team). Pin color = blue if the tracked team got it, red if the enemy. Pin position flips to the bottom of the plot when the line is below zero at that minute, with a dashed guide line spanning the chart
-- **Kill X-stacks** — for every kill the tracked player gets, an X anchored at the y = 0 baseline. Multikills within 10 s collapse into one column that stacks `XX` / `XXX` / `XXXX` / `XXXXX` vertically, with colors escalating yellow → orange → red → purple → hot pink for single → penta. The stack direction flips down when the player is behind at that moment
-- **💾 Save** and **📌 Keep in Chat** buttons — see *Save / Keep* below
+1. **Splash card** (main, portrait) — per tracked player: faded champion splash art background (Community Dragon's centered variant so the face always lands in frame), avatar with tier-color ring, big colored KDA (green/grey/red/grey/blue), CS · DMG · KP% stats, Today: XW YL 🔥 daily record, ✓/✕ Won Lane with gold-diff. Duos stack two splash cards vertically inside the same image. Below the card: **BETS SETTLED** (House + top 2 user bets by amount), an optional PARLAY block, and the **GOLD GRAPH** — a full-width chart of team gold lead over time with:
+   - Blue area-fill above zero (ahead), red below (behind)
+   - Peak callouts for max lead + max deficit (`+5.4k @ 22m` / `-2.8k @ 8m`)
+   - **Objective pins** — real Riot minimap icons (`assets/objectives/`) for Baron, Rift Herald, Void Grubs, all six elemental dragons, and Dragon Soul. Blue if the tracked team got it, red if the enemy. Pin flips to the bottom of the plot when the line is below zero at that minute
+   - **Kill X-stacks** — one X per tracked-player kill, anchored to the y=0 baseline; multikills within 10s collapse into a `XX`/`XXX`/`XXXX`/`XXXXX` column colored yellow→orange→red→purple→hot pink for single→penta
+2. **Scoreboard panel** (top-right) — full 10-player table grouped by team, with the **live-scoreboard visual language**: primary keystone rune + secondary rune path stacked, summoner spells (D+F) stacked, champion avatar with a level-pip, then columns for K/D/A (colored), CS, DMG, KP%, Gold, and the 7 item slots (Data Dragon item icons)
+3. **Impact chart** (bottom-right) — vertical triple-bar chart for all 10 players: **Damage · CC Score · Vision Score**, normalized to lobby-max per metric so the tallest bar per color is the leader. Small gold ▼ marker above each metric's leader; tracked player's column has a gold-tinted background stripe
 
-### LP Graph (`/lp`)
+- **📌 Keep in Chat** button — re-posts the composite as a standalone message that survives the auto-clear (see *Save / Keep* below)
 
-Per-player LP history rendered locally. Captures a snapshot on every match-end peak check and on every `/rank` call (skips duplicates when LP/tier hasn't changed). Renders:
+### LP Profile card (`/lp`)
 
-- Single line plotting **absolute LP** so promotions across divisions read as a continuous climb
-- **Tier bands** drawn as faint colored zones with labels (Iron through Master+); always extends the visible range to include at least half of the tier band below the player, so a Master player can see how far above Diamond they are
-- **Tier boundary lines** — dashed horizontal markers at each promotion threshold
-- **Per-point W/L colors** — green when LP rose from the previous entry, red when it fell, blue for the first point
-- Peak callout with the tier+rank+LP at the high point, "now: …" callout at the current point
+Full profile card per player. Captures an LP snapshot on every match end + `/rank` call (skips duplicates when LP/tier hasn't changed). Layout:
+
+- **Header** — profile icon with tier-color ring + summoner-level badge, big `RiotID#TAG`, mini-crest + `TIER DIVISION` label, and the player's **top-champion splash art** faded into the right half of the header (Champion Mastery-V4, cached 1 h per player)
+- **Stat tiles** — Current LP (with mini-crest), Peak LP (with mini-crest for the peak tier), Win Rate donut (green/red) + `W L` breakdown
+- **Progress bar** — tier-color bar filled to `lp / next_threshold`, with `X LP to <NEXT_TIER>` on the right. Uses live apex cutoffs for Master → GM and GM → Challenger; "Awaiting promo" when a Master player's LP already exceeds the live GM cutoff
+- **LP History chart** — line plotting absolute LP so promotions read as a continuous climb, with:
+  - **Rank-label Y-axis** for sub-master ticks (`D4`, `D3`, `E1`, …) and `MAS X` raw LP once you cross 2800
+  - **Tier-color background bands** so you can see at a glance which division a data point sits in
+  - **Dashed reference lines** at the Master threshold and the live apex cutoff
+  - **Per-segment line colors** — green segment when LP rose, red when it fell
+  - **Dots only at peaks and pits** — windowed local-extremum detection so long histories don't get dotted at every game
+  - **End-of-line callout** with the current rank + LP (e.g. `D4 45 LP`, `MAS 575 LP`)
+
+### Rank Ladder (`/rank`)
+
+Card-based ladder sorted by absolute LP (highest first). Each row shows:
+- Rank number (👑 for #1 with a gold accent, plain number for the rest; 🥀 prefix on the last-place row)
+- Summoner profile icon
+- Player name + "Peak: `<TIER>`" subtitle (or "CURRENT PEAK!" in gold when they're at their all-time peak)
+- Tier emblem (source-cropped so the crest fills the slot cleanly, no wing squish)
+- `TIER DIVISION` label + big LP + progress bar to next tier with `X LP to Y` text (next-tier name colored with that tier's color — GM in red, Challenger in gold, etc.)
+- Weekly LP delta (↑ green / ↓ red) computed from the earliest lp_history entry within the past 7 days
 
 ### Profit Chart (`/stats`)
 
@@ -77,9 +106,9 @@ Both buttons are gated by `config.saveGraphAllowedUserIds` — only the listed D
 
 ## Message Lifecycle & Cleanup
 
-- The bot edits the Match Detected embed to "BETTING CLOSED" when the window expires
-- It deletes the match-detected, betting-closed, and any auto-bet notification messages when the match ends
-- It deletes the previous Match Over embed when the same player enters their next game
+- The bot **strips the betting buttons** off the Match Detected message when the 5-minute window closes (edit in place — no delete + resend)
+- With `/autodelete on` (default): deletes the Match Detected + previous Match Over messages when the same player enters their next game
+- With `/autodelete off`: keeps every Match Detected / Match Over in the channel as a persistent history log (per-guild setting, stored in `guild_settings.auto_delete_enabled`)
 - **Nightly cleanup** — at 12:01 AM local time the bot deletes its own messages from the past 3 days in the configured channel, skipping anything tied to an in-progress match
 - **Manual cleanup** — `node cleanup-recent.js [--dry-run] [days=3]` runs the same logic on demand
 
@@ -247,6 +276,8 @@ Get an emoji ID by typing `\:emojiname:` in Discord and sending the message.
 - `sounds/` — voice-channel join sound files (named after Discord user IDs, personal)
 - `saved-graphs/` — user-saved Match Over PNGs
 - `.claude/` — Claude Code local state
+- `assets/champions/`, `assets/profile-icons/`, `assets/ranks/`, `assets/ranks-mini/`, `assets/lanes/`, `assets/splash/`, `assets/items/`, `assets/summoner-spells/`, `assets/runes/` — auto-downloaded Data Dragon / Community Dragon caches. Populated lazily on first use; safe to delete at any time (they refetch)
+- `data/` — Meraki play-rate cache (used by lane inference)
 
 ## Riot API Notes
 
@@ -254,7 +285,23 @@ The bot uses two endpoint groups:
 
 | Type | Example host | Used for |
 |---|---|---|
-| Platform (region) | `na1.api.riotgames.com` | Spectator-V5, League-V4 |
+| Platform (region) | `na1.api.riotgames.com` | Spectator-V5, League-V4 entries + apex ladders, Summoner-V4, Champion-Mastery-V4 |
 | Regional (continent) | `americas.api.riotgames.com` | Account-V1, Match-V5, Match-V5 Timeline |
 
 The platform code from `RIOT_REGION` auto-maps to the correct regional endpoint. If you rotate your API key, just update `.env` and restart — PUUIDs are re-fetched on startup so the bot keeps working with the new key.
+
+**Rate limiting** — one global semaphore caps concurrent Riot fetches at 10. 429 responses trigger auto-retry with `Retry-After` sleep + a shared cooldown so other in-flight requests short-circuit until Riot recovers. Cached call sites: apex ladders (6h per region), top champion (1h per player), Data Dragon champion metadata (once per bot start).
+
+## Asset CDNs
+
+Icon assets are lazy-fetched from Data Dragon or Community Dragon on first use and cached locally under `assets/`. See [src/utils/](src/utils/) for the fetchers:
+
+| Util | Source | Cached to |
+|---|---|---|
+| `championIcons.js` | Data Dragon `img/champion/<Name>.png` | `assets/champions/` |
+| `championSplash.js` | Community Dragon centered splash | `assets/splash/` |
+| `itemIcons.js` | Data Dragon `img/item/<id>.png` | `assets/items/` |
+| `laneIcons.js` | Community Dragon position-selector | `assets/lanes/` |
+| `profileIcons.js` | Data Dragon `img/profileicon/<id>.png` | `assets/profile-icons/` |
+| `rankEmblems.js` | Community Dragon ranked-emblem + mini-crest | `assets/ranks/` + `assets/ranks-mini/` |
+| `runeIcons.js` | Community Dragon perks + perkstyles + summoner-spells | `assets/runes/` + `assets/summoner-spells/` |
