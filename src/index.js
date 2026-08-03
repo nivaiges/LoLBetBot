@@ -14,7 +14,9 @@ import {
   getActiveMatchByMessageId,
   getUserBetOnMatch,
   deductCoins,
+  addCoins,
   placeBet,
+  updateBet,
   getMatchParlay,
   getUserParleyBetOnMatch,
   placeParleyBet,
@@ -369,36 +371,48 @@ client.on('interactionCreate', async (interaction) => {
 
       const user = ensureUser(guildId, userId);
 
-      let autoCollected = false;
-      if (user.coins < amount) {
-        const collected = tryAutoCollect(guildId, userId, user);
-        if (collected !== null) {
-          user.coins = collected;
-          autoCollected = true;
-        }
-        if (user.coins < amount) {
-          return interaction.reply({ content: `💰 Insufficient coins. You have **${user.coins.toLocaleString()}** 🪙.`, ephemeral: true });
-        }
-      }
-
-      const existing = getUserBetOnMatch(guildId, userId, matchId);
-      if (existing) {
-        return interaction.reply({ content: `⚠️ You already bet **${existing.prediction.toUpperCase()}** (${existing.amount.toLocaleString()} 🪙) on this match.`, ephemeral: true });
-      }
-
       // Moneyline: multiplier locked in at match detection; fall back to
       // legacy flat rates for pre-migration matches.
       const activeMult = prediction === 'win' ? match.win_multiplier : match.lose_multiplier;
       const multiplier = activeMult ?? (prediction === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier);
       const potential = Math.floor(amount * multiplier);
 
-      deductCoins(guildId, userId, amount);
-      placeBet(guildId, userId, matchId, match.puuid, prediction, amount, null, multiplier);
+      // Last-bet-wins: any prior bet on this match (autobet, /bet, or a prior
+      // button click) is refunded and replaced by this one. Balance check is
+      // done against (user.coins + refund) so someone spending down after an
+      // autobet fired can still re-bet at the same amount.
+      const existing = getUserBetOnMatch(guildId, userId, matchId);
+      const priorRefund = existing ? existing.amount : 0;
+      const effectiveBalance = user.coins + priorRefund;
+
+      let autoCollected = false;
+      if (effectiveBalance < amount) {
+        const collected = tryAutoCollect(guildId, userId, user);
+        if (collected !== null) {
+          user.coins = collected;
+          autoCollected = true;
+        }
+        if (user.coins + priorRefund < amount) {
+          return interaction.reply({ content: `💰 Insufficient coins. You have **${(user.coins + priorRefund).toLocaleString()}** 🪙${existing ? ` (including your current ${priorRefund.toLocaleString()} bet)` : ''}.`, ephemeral: true });
+        }
+      }
+
+      if (existing) {
+        addCoins(guildId, userId, priorRefund);
+        deductCoins(guildId, userId, amount);
+        updateBet(existing.id, prediction, amount, multiplier);
+      } else {
+        deductCoins(guildId, userId, amount);
+        placeBet(guildId, userId, matchId, match.puuid, prediction, amount, null, multiplier);
+      }
 
       const emoji = prediction === 'win' ? '🟢' : '🔴';
       const collectNote = autoCollected ? `\n🪙 Auto-collected **${config.collectAmount.toLocaleString()}** coins!` : '';
+      const priorTag = existing
+        ? ` _(replaced prior ${existing.prediction.toUpperCase()} ${priorRefund.toLocaleString()} 🪙)_`
+        : '';
       return interaction.reply(
-        `${emoji} **${interaction.user.username}** bet **${prediction.toUpperCase()}** for **${amount.toLocaleString()}** 🪙 @ **${multiplier}x** → win **${potential.toLocaleString()}** 🪙${collectNote}`
+        `${emoji} **${interaction.user.username}** bet **${prediction.toUpperCase()}** for **${amount.toLocaleString()}** 🪙 @ **${multiplier}x** → win **${potential.toLocaleString()}** 🪙${priorTag}${collectNote}`
       );
     }
 
