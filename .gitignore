@@ -29,4 +29,9 @@ assets/splash/
 assets/items/
 assets/summoner-spells/
 assets/runes/
+
+# champion_winrates.py runtime output
+.riot_cache/
+winrates.csv
+pairs.csv
 data/
