@@ -3484,9 +3484,14 @@ export async function renderMatchOverImpactPng(opts = {}) {
   const SUBTLE = '#80848e';
 
   // Bar colors — distinct hue per metric so all three read at a glance.
-  const DMG_COLOR    = '#f0b232'; // amber — damage
-  const CC_COLOR     = '#9b59b6'; // purple — control
-  const VISION_COLOR = '#3cbec8'; // cyan — vision/wards
+  // The damage bar is stacked into three sub-colors (phys/mag/true) that sum
+  // to total damage; DMG_COLOR is retained for the outline + leader marker.
+  const DMG_COLOR       = '#f0b232'; // amber — damage (outline / leader)
+  const DMG_PHYSICAL    = '#e67e22'; // orange — AD
+  const DMG_MAGICAL     = '#5b7cff'; // blue-violet — AP
+  const DMG_TRUE        = '#f5deb3'; // pale gold — true
+  const CC_COLOR        = '#9b59b6'; // purple — control
+  const VISION_COLOR    = '#3cbec8'; // cyan — vision/wards
 
   try {
     const SCALE = 2;
@@ -3522,11 +3527,19 @@ export async function renderMatchOverImpactPng(opts = {}) {
       ...blueTeam.map(p => ({ p, team: 'blue', color: BLUE })),
       ...redTeam.map (p => ({ p, team: 'red',  color: RED  })),
     ];
-    const metricsFor = (p) => ({
-      dmg:    p.totalDamageDealtToChampions || 0,
-      cc:     Math.round(p.timeCCingOthers || 0),
-      vision: p.visionScore || 0,
-    });
+    const metricsFor = (p) => {
+      const phys = p.physicalDamageDealtToChampions || 0;
+      const mag  = p.magicDamageDealtToChampions    || 0;
+      const tru  = p.trueDamageDealtToChampions     || 0;
+      // Prefer the reported total, but fall back to the sum when Match-V5
+      // omits the field on odd game modes.
+      const dmg  = p.totalDamageDealtToChampions ?? (phys + mag + tru);
+      return {
+        dmg, phys, mag, tru,
+        cc:     Math.round(p.timeCCingOthers || 0),
+        vision: p.visionScore || 0,
+      };
+    };
     const stats = all.map(x => metricsFor(x.p));
     const dmgMax    = Math.max(1, ...stats.map(s => s.dmg));
     const ccMax     = Math.max(1, ...stats.map(s => s.cc));
@@ -3550,7 +3563,9 @@ export async function renderMatchOverImpactPng(opts = {}) {
         return ctx.measureText(text).width + 20 + 18;
       };
       let lx = padX;
-      lx += pip(lx, DMG_COLOR,    'Damage');
+      lx += pip(lx, DMG_PHYSICAL, 'Physical');
+      lx += pip(lx, DMG_MAGICAL,  'Magical');
+      lx += pip(lx, DMG_TRUE,     'True');
       lx += pip(lx, CC_COLOR,     'CC Score');
       lx += pip(lx, VISION_COLOR, 'Vision Score');
     }
@@ -3621,11 +3636,24 @@ export async function renderMatchOverImpactPng(opts = {}) {
         ctx.restore();
       }
 
-      // Three bars
+      // Three bars — the damage bar is stacked (phys / mag / true) so all
+      // three components read at once while the total height still scales
+      // to lobby-max damage. CC and Vision are plain single-color bars.
       const bars = [
-        { val: s.dmg,    max: dmgMax,    color: DMG_COLOR,    isLeader: i === dmgLeader,    label: formatNumber(s.dmg) },
-        { val: s.cc,     max: ccMax,     color: CC_COLOR,     isLeader: i === ccLeader,     label: String(s.cc) },
-        { val: s.vision, max: visionMax, color: VISION_COLOR, isLeader: i === visionLeader, label: String(s.vision) },
+        {
+          kind: 'stacked',
+          val: s.dmg,
+          max: dmgMax,
+          segments: [
+            { val: s.phys, color: DMG_PHYSICAL },
+            { val: s.mag,  color: DMG_MAGICAL  },
+            { val: s.tru,  color: DMG_TRUE     },
+          ],
+          isLeader: i === dmgLeader,
+          label: formatNumber(s.dmg),
+        },
+        { kind: 'flat', val: s.cc,     max: ccMax,     color: CC_COLOR,     isLeader: i === ccLeader,     label: String(s.cc) },
+        { kind: 'flat', val: s.vision, max: visionMax, color: VISION_COLOR, isLeader: i === visionLeader, label: String(s.vision) },
       ];
       for (let b = 0; b < 3; b++) {
         const bar = bars[b];
@@ -3638,10 +3666,54 @@ export async function renderMatchOverImpactPng(opts = {}) {
         ctx.fillStyle = 'rgba(255,255,255,0.05)';
         roundRect(ctx, bx, baseY - barMaxH, barW, barMaxH, 2);
         ctx.fill();
-        // Bar fill
-        ctx.fillStyle = bar.color;
-        roundRect(ctx, bx, by, barW, bh, 2);
-        ctx.fill();
+
+        if (bar.kind === 'stacked') {
+          // Stack physical → magical → true from the base up. Each segment's
+          // height is (component / total) * bh. Zero-total guard keeps us
+          // out of NaN territory on games where no damage was dealt.
+          const total = bar.segments.reduce((sum, seg) => sum + seg.val, 0);
+          if (total > 0 && bar.val > 0) {
+            let cursorY = baseY; // draw upward from the baseline
+            for (let si = 0; si < bar.segments.length; si++) {
+              const seg = bar.segments[si];
+              if (seg.val <= 0) continue;
+              const segH = (seg.val / total) * bh;
+              const segY = cursorY - segH;
+              ctx.fillStyle = seg.color;
+              // Only round the top of the top-most drawn segment; middle
+              // and bottom segments stay square so they butt up cleanly.
+              const isTopSegment = si === bar.segments.length - 1
+                || bar.segments.slice(si + 1).every(s2 => s2.val <= 0);
+              if (isTopSegment) {
+                // Manual round-top rect — roundRect() rounds all corners.
+                const r = 2;
+                ctx.beginPath();
+                ctx.moveTo(bx, segY + r);
+                ctx.quadraticCurveTo(bx, segY, bx + r, segY);
+                ctx.lineTo(bx + barW - r, segY);
+                ctx.quadraticCurveTo(bx + barW, segY, bx + barW, segY + r);
+                ctx.lineTo(bx + barW, segY + segH);
+                ctx.lineTo(bx, segY + segH);
+                ctx.closePath();
+                ctx.fill();
+              } else {
+                ctx.fillRect(bx, segY, barW, segH);
+              }
+              cursorY = segY;
+            }
+          } else {
+            // No damage → draw the flat 2px sliver so the slot isn't empty.
+            ctx.fillStyle = DMG_COLOR;
+            roundRect(ctx, bx, by, barW, bh, 2);
+            ctx.fill();
+          }
+        } else {
+          // Flat single-color bar (CC / Vision)
+          ctx.fillStyle = bar.color;
+          roundRect(ctx, bx, by, barW, bh, 2);
+          ctx.fill();
+        }
+
         // Leader marker — small gold downward triangle above the bar, drawn
         // as a path so we don't depend on the host font for glyphs. Sits
         // above the value label.
