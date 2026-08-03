@@ -185,6 +185,25 @@ function migrate() {
     db.exec(`ALTER TABLE tracked_players ADD COLUMN lane_losses INTEGER NOT NULL DEFAULT 0`);
   }
 
+  if (!tpCols.includes('is_smurf')) {
+    db.exec(`ALTER TABLE tracked_players ADD COLUMN is_smurf INTEGER NOT NULL DEFAULT 0`);
+  }
+
+  // Moneyline odds — stored on active_matches at detection time so every bet
+  // placed against that match locks in the same quoted multiplier.
+  const amCols2 = db.prepare("PRAGMA table_info('active_matches')").all().map(c => c.name);
+  if (!amCols2.includes('p_win')) {
+    db.exec(`ALTER TABLE active_matches ADD COLUMN p_win REAL`);
+    db.exec(`ALTER TABLE active_matches ADD COLUMN win_multiplier REAL`);
+    db.exec(`ALTER TABLE active_matches ADD COLUMN lose_multiplier REAL`);
+  }
+  // Per-bet multiplier — set at placement, used at settle. Nullable so old
+  // pre-moneyline bets fall back to config.payoutMultiplier / losePayoutMultiplier.
+  const betsCols = db.prepare("PRAGMA table_info('bets')").all().map(c => c.name);
+  if (!betsCols.includes('multiplier')) {
+    db.exec(`ALTER TABLE bets ADD COLUMN multiplier REAL`);
+  }
+
   // Migrate parley_bets: old schema had single `prediction TEXT`, new schema uses `predictions TEXT` (JSON array)
   const parleyBetsCols = db.prepare("PRAGMA table_info('parley_bets')").all().map(c => c.name);
   if (!parleyBetsCols.includes('predictions')) {
@@ -367,14 +386,21 @@ export function deductCoins(guildId, discordId, amount) {
 }
 
 // Tracked players
-export function addTrackedPlayer(guildId, riotTag, puuid, region) {
+export function addTrackedPlayer(guildId, riotTag, puuid, region, isSmurf = false) {
   return db.prepare(`
-    INSERT OR IGNORE INTO tracked_players (guild_id, riot_tag, puuid, region)
-    VALUES (?, ?, ?, ?)
-  `).run(guildId, riotTag, puuid, region);
+    INSERT OR IGNORE INTO tracked_players (guild_id, riot_tag, puuid, region, is_smurf)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(guildId, riotTag, puuid, region, isSmurf ? 1 : 0);
 }
 
-export function getTrackedPlayers(guildId) {
+// filter: 'all' (default), 'mains' (is_smurf=0), or 'smurfs' (is_smurf=1)
+export function getTrackedPlayers(guildId, filter = 'all') {
+  if (filter === 'mains') {
+    return db.prepare('SELECT * FROM tracked_players WHERE guild_id = ? AND is_smurf = 0').all(guildId);
+  }
+  if (filter === 'smurfs') {
+    return db.prepare('SELECT * FROM tracked_players WHERE guild_id = ? AND is_smurf = 1').all(guildId);
+  }
   return db.prepare('SELECT * FROM tracked_players WHERE guild_id = ?').all(guildId);
 }
 
@@ -450,11 +476,11 @@ export function touchMatch(id) {
 }
 
 // Bets
-export function placeBet(guildId, discordId, matchId, puuid, prediction, amount, houseConfidence = null) {
+export function placeBet(guildId, discordId, matchId, puuid, prediction, amount, houseConfidence = null, multiplier = null) {
   return db.prepare(`
-    INSERT INTO bets (guild_id, discord_id, match_id, puuid, prediction, amount, house_confidence)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(guildId, discordId, matchId, puuid, prediction, amount, houseConfidence);
+    INSERT INTO bets (guild_id, discord_id, match_id, puuid, prediction, amount, house_confidence, multiplier)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(guildId, discordId, matchId, puuid, prediction, amount, houseConfidence, multiplier);
 }
 
 export function getUserBetOnMatch(guildId, discordId, matchId) {
@@ -463,10 +489,10 @@ export function getUserBetOnMatch(guildId, discordId, matchId) {
   `).get(guildId, discordId, matchId);
 }
 
-export function updateBet(betId, prediction, amount) {
+export function updateBet(betId, prediction, amount, multiplier = null) {
   return db.prepare(`
-    UPDATE bets SET prediction = ?, amount = ? WHERE id = ? AND outcome IS NULL
-  `).run(prediction, amount, betId);
+    UPDATE bets SET prediction = ?, amount = ?, multiplier = ? WHERE id = ? AND outcome IS NULL
+  `).run(prediction, amount, multiplier, betId);
 }
 
 export function getUnresolvedBetsByMatch(guildId, matchId) {
@@ -609,6 +635,17 @@ export function resolveParleyBet(betId, outcome) {
   db.prepare(`
     UPDATE parley_bets SET outcome = ?, resolved_at = datetime('now') WHERE id = ?
   `).run(outcome, betId);
+}
+
+// Moneyline odds — stamped on the active_matches row for every tracked
+// player in this match (each duo partner gets their own row, but for a shared
+// match all rows carry the same odds relative to their own trackedTeamId).
+// Callers must pass the odds computed from that specific player's perspective.
+export function setActiveMatchOdds(guildId, puuid, matchId, pWin, winMult, loseMult) {
+  db.prepare(`
+    UPDATE active_matches SET p_win = ?, win_multiplier = ?, lose_multiplier = ?
+    WHERE guild_id = ? AND puuid = ? AND match_id = ?
+  `).run(pWin, winMult, loseMult, guildId, puuid, matchId);
 }
 
 // Message tracking (per-player: each tracked player in the same match has their own messages)

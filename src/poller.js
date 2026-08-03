@@ -26,6 +26,7 @@ import {
   resolveParleyBet,
   setMatchMessageIdForAllInMatch,
   setMatchCloseMessageId,
+  setActiveMatchOdds,
   getMatchMessages,
   recordDailyResult,
   getDailyRecord,
@@ -281,7 +282,12 @@ const HOUSE_BET = config.house.bet;
 const HOUSE_TOPUP_TO = config.house.topupTo;
 const UNRANKED_SKILL = 14;
 
-function computeHouseBet(participants, trackedTeamId) {
+// Shared skill-differential model. Returns pWin from the tracked player's
+// perspective, plus per-side moneyline multipliers derived from that pWin
+// (with houseEdge vig + min/max clamps applied). This runs for EVERY match —
+// The House uses it to decide whether to bet, and users see the multipliers
+// on the Match Detected card. Returns null only when teams are malformed.
+export function computeMatchOdds(participants, trackedTeamId) {
   const skill = (p) => {
     const v = rankToValue(p.tier, p.rank);
     return v == null ? UNRANKED_SKILL : v;
@@ -294,9 +300,29 @@ function computeHouseBet(participants, trackedTeamId) {
   const trackedAvg = trackedTeamId === 100 ? blueAvg : redAvg;
   const enemyAvg = trackedTeamId === 100 ? redAvg : blueAvg;
   const pWin = 1 / (1 + Math.exp(-0.15 * (trackedAvg - enemyAvg)));
+
+  const edge = 1 - config.houseEdge;
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const rawWin = edge / pWin;
+  const rawLose = edge / (1 - pWin);
+  const winMult = Math.round(clamp(rawWin, config.minWinMultiplier, config.maxWinMultiplier) * 100) / 100;
+  const loseMult = Math.round(clamp(rawLose, config.minLoseMultiplier, config.maxLoseMultiplier) * 100) / 100;
+
+  return {
+    pWin,
+    favorite: pWin >= 0.5 ? 'win' : 'lose',
+    winMult,
+    loseMult,
+  };
+}
+
+function computeHouseBet(participants, trackedTeamId) {
+  const odds = computeMatchOdds(participants, trackedTeamId);
+  if (!odds) return null;
+  const { pWin } = odds;
   const t = config.house.edgeThreshold;
-  if (pWin >= t) return { prediction: 'win', confidence: pWin };
-  if (pWin <= 1 - t) return { prediction: 'lose', confidence: 1 - pWin };
+  if (pWin >= t) return { prediction: 'win', confidence: pWin, odds };
+  if (pWin <= 1 - t) return { prediction: 'lose', confidence: 1 - pWin, odds };
   return null;
 }
 
@@ -447,6 +473,17 @@ async function checkForNewMatches() {
       const sideName = trackedTeamId === 100 ? 'Blue' : 'Red';
       const sideColor = trackedTeamId === 100 ? 0x5DADE2 : 0xE74C3C;
 
+      // Moneyline odds — compute once from the tracked player's perspective
+      // and stamp on every duo-partner's active_matches row (they're on the
+      // same team, so the same odds apply). Bets placed on this match will
+      // read these numbers to lock in the multiplier at placement time.
+      const odds = computeMatchOdds(participants, trackedTeamId);
+      if (odds) {
+        for (const pl of [player, ...duoPartners]) {
+          setActiveMatchOdds(pl.guild_id, pl.puuid, matchId, odds.pWin, odds.winMult, odds.loseMult);
+        }
+      }
+
       const blueTeam = participants.filter(p => p.teamId === 100);
       const redTeam = participants.filter(p => p.teamId === 200);
 
@@ -523,10 +560,12 @@ async function checkForNewMatches() {
           continue;
         }
         deductCoins(player.guild_id, ab.discord_id, ab.amount);
-        placeBet(player.guild_id, ab.discord_id, matchId, player.puuid, ab.prediction, ab.amount);
-        const mult = ab.prediction === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier;
-        const potential = Math.floor(ab.amount * mult);
-        autoBetLines.push(`• ${displayName} — bet ${ab.prediction.toUpperCase()} ${ab.amount.toLocaleString()} 🪙 → win ${potential.toLocaleString()} 🪙`);
+        const abMult = odds
+          ? (ab.prediction === 'win' ? odds.winMult : odds.loseMult)
+          : (ab.prediction === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier);
+        placeBet(player.guild_id, ab.discord_id, matchId, player.puuid, ab.prediction, ab.amount, null, abMult);
+        const potential = Math.floor(ab.amount * abMult);
+        autoBetLines.push(`• ${displayName} — bet ${ab.prediction.toUpperCase()} ${ab.amount.toLocaleString()} 🪙 @ ${abMult}x → win ${potential.toLocaleString()} 🪙`);
       }
 
       // The House — automated rank-skill bettor.
@@ -538,11 +577,11 @@ async function checkForNewMatches() {
           addCoins(player.guild_id, HOUSE_ID, HOUSE_TOPUP_TO - houseUser.coins);
         }
         deductCoins(player.guild_id, HOUSE_ID, HOUSE_BET);
-        placeBet(player.guild_id, HOUSE_ID, matchId, player.puuid, houseChoice.prediction, HOUSE_BET, houseChoice.confidence);
-        const hMult = houseChoice.prediction === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier;
+        const hMult = houseChoice.prediction === 'win' ? houseChoice.odds.winMult : houseChoice.odds.loseMult;
+        placeBet(player.guild_id, HOUSE_ID, matchId, player.puuid, houseChoice.prediction, HOUSE_BET, houseChoice.confidence, hMult);
         const hPotential = Math.floor(HOUSE_BET * hMult);
         const conf = Math.round(houseChoice.confidence * 100);
-        autoBetLines.push(`• ${HOUSE_LABEL} (${conf}%) — bet ${houseChoice.prediction.toUpperCase()} ${HOUSE_BET.toLocaleString()} 🪙 → win ${hPotential.toLocaleString()} 🪙`);
+        autoBetLines.push(`• ${HOUSE_LABEL} (${conf}%) — bet ${houseChoice.prediction.toUpperCase()} ${HOUSE_BET.toLocaleString()} 🪙 @ ${hMult}x → win ${hPotential.toLocaleString()} 🪙`);
       }
 
       // Parlay summary for the image (label + legs line).
@@ -644,6 +683,21 @@ async function checkForNewMatches() {
       } else {
         // Render failed — fall back to a text-only Match Detected.
         sendPayload.content = `⚔ **MATCH DETECTED** — ${name}${trackedChamp ? ` on ${trackedChamp}` : ''}`;
+      }
+      // Moneyline banner — favorite/underdog + per-side multipliers.
+      // `Payouts include a ${vig}% house edge.` disclosure kept short.
+      if (odds) {
+        const favSide = odds.favorite === 'win' ? '🟢 WIN' : '🔴 LOSE';
+        const pct = Math.round(odds.pWin * 100);
+        const favPct = odds.favorite === 'win' ? pct : 100 - pct;
+        const vigPct = Math.round(config.houseEdge * 100);
+        const moneyline =
+          `📊 **Moneyline** — favorite: ${favSide} (${favPct}%) · ` +
+          `WIN pays **${odds.winMult}x** · LOSE pays **${odds.loseMult}x** ` +
+          `_(includes ${vigPct}% house edge)_`;
+        sendPayload.content = sendPayload.content
+          ? `${moneyline}\n${sendPayload.content}`
+          : moneyline;
       }
       const msg = await sendToGuild(player.guild_id, sendPayload);
       if (msg) {
@@ -989,8 +1043,10 @@ async function checkActiveMatches() {
       const predictedWin = bet.prediction === 'win';
       const correct = predictedWin === trackedPlayerWon;
       const outcome = correct ? 'correct' : 'incorrect';
-      const multiplier = bet.prediction === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier;
-      const payout = correct ? bet.amount * multiplier : 0;
+      // Prefer the multiplier stored at bet placement time (moneyline); fall
+      // back to flat rates only for legacy bets from before the migration.
+      const multiplier = bet.multiplier ?? (bet.prediction === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier);
+      const payout = correct ? Math.floor(bet.amount * multiplier) : 0;
 
       resolveBet(bet.id, outcome);
       updateUserStats(first.guild_id, bet.discord_id, correct, payout);

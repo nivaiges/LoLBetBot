@@ -17,14 +17,30 @@ function rankToValue(tier, division) {
 
 export const data = new SlashCommandBuilder()
   .setName('rank')
-  .setDescription('Fetch fresh ranks from Riot and render the ladder chart');
+  .setDescription('Fetch fresh ranks from Riot and render the ladder chart')
+  .addStringOption(opt =>
+    opt.setName('filter')
+      .setDescription('Which accounts to include (default: mains only)')
+      .setRequired(false)
+      .addChoices(
+        { name: 'mains',  value: 'mains'  },
+        { name: 'smurfs', value: 'smurfs' },
+        { name: 'all',    value: 'all'    },
+      )
+  );
 
 export async function execute(interaction) {
   const guildId = interaction.guildId;
-  const players = getTrackedPlayers(guildId);
+  const filter = interaction.options.getString('filter') ?? 'mains';
+  const players = getTrackedPlayers(guildId, filter);
 
   if (!players.length) {
-    return interaction.reply({ content: 'No tracked players. Use `/adduser` to add some.', ephemeral: true });
+    const emptyMsg = filter === 'smurfs'
+      ? 'No smurf accounts tracked. Add one with `/adduser` and set `smurf: True`.'
+      : filter === 'mains'
+        ? 'No main accounts tracked. Use `/adduser` to add some.'
+        : 'No tracked players. Use `/adduser` to add some.';
+    return interaction.reply({ content: emptyMsg, ephemeral: true });
   }
 
   // Pre-flight: bail with a clear message instead of starting work the
@@ -118,8 +134,9 @@ export async function execute(interaction) {
     }
   }
 
+  const titleSuffix = filter === 'smurfs' ? ' (Smurfs)' : filter === 'all' ? ' (All)' : '';
   const png = await renderRankLadderPng(ranked, {
-    title: 'Tracked Players — Rank Ladder',
+    title: `Tracked Players — Rank Ladder${titleSuffix}`,
     decorateFirstLast: true, // 👑 on first place, 🥀 on last place — /rank only
   });
   if (!png) {

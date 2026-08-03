@@ -102,6 +102,13 @@ export async function execute(interaction) {
     }
   }
 
+  // Moneyline: use the multiplier locked in at match detection. Falls back
+  // to the flat config values only for legacy matches detected before the
+  // moneyline migration (win_multiplier is NULL on those rows).
+  const activeMult = prediction === 'win' ? match.win_multiplier : match.lose_multiplier;
+  const multiplier = activeMult ?? (prediction === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier);
+  const potential = Math.floor(amount * multiplier);
+
   // Check existing bet — allow updating during betting window
   const existingBet = getUserBetOnMatch(guildId, userId, match.match_id);
   if (existingBet) {
@@ -114,22 +121,22 @@ export async function execute(interaction) {
       return interaction.reply({ content: `Insufficient coins. You have **${(refreshed.coins - existingBet.amount).toLocaleString()}** coins (plus ${existingBet.amount.toLocaleString()} in your current bet).`, ephemeral: true });
     }
     deductCoins(guildId, userId, amount);
-    updateBet(existingBet.id, prediction, amount);
+    updateBet(existingBet.id, prediction, amount, multiplier);
 
     const changed = existingBet.prediction !== prediction
       ? ` (changed from ${existingBet.prediction.toUpperCase()})`
       : '';
     return interaction.reply(
-      `Bet updated: **${prediction.toUpperCase()}** on **${displayTag(target.riot_tag)}** for **${amount.toLocaleString()}** coins${changed}. (was ${existingBet.amount.toLocaleString()} coins)`
+      `Bet updated: **${prediction.toUpperCase()}** on **${displayTag(target.riot_tag)}** for **${amount.toLocaleString()}** coins @ **${multiplier}x** → win **${potential.toLocaleString()}** 🪙${changed}. (was ${existingBet.amount.toLocaleString()} coins)`
     );
   }
 
   // Place new bet
   deductCoins(guildId, userId, amount);
-  placeBet(guildId, userId, match.match_id, target.puuid, prediction, amount);
+  placeBet(guildId, userId, match.match_id, target.puuid, prediction, amount, null, multiplier);
 
   const collectNote = autoCollected ? `\n🪙 Auto-collected **${config.collectAmount.toLocaleString()}** coins!` : '';
   return interaction.reply(
-    `Bet placed: **${prediction.toUpperCase()}** on **${displayTag(target.riot_tag)}** for **${amount.toLocaleString()}** coins.${collectNote}`
+    `Bet placed: **${prediction.toUpperCase()}** on **${displayTag(target.riot_tag)}** for **${amount.toLocaleString()}** coins @ **${multiplier}x** → win **${potential.toLocaleString()}** 🪙.${collectNote}`
   );
 }

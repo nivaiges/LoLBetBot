@@ -386,13 +386,19 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: `⚠️ You already bet **${existing.prediction.toUpperCase()}** (${existing.amount.toLocaleString()} 🪙) on this match.`, ephemeral: true });
       }
 
+      // Moneyline: multiplier locked in at match detection; fall back to
+      // legacy flat rates for pre-migration matches.
+      const activeMult = prediction === 'win' ? match.win_multiplier : match.lose_multiplier;
+      const multiplier = activeMult ?? (prediction === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier);
+      const potential = Math.floor(amount * multiplier);
+
       deductCoins(guildId, userId, amount);
-      placeBet(guildId, userId, matchId, match.puuid, prediction, amount);
+      placeBet(guildId, userId, matchId, match.puuid, prediction, amount, null, multiplier);
 
       const emoji = prediction === 'win' ? '🟢' : '🔴';
       const collectNote = autoCollected ? `\n🪙 Auto-collected **${config.collectAmount.toLocaleString()}** coins!` : '';
       return interaction.reply(
-        `${emoji} **${interaction.user.username}** bet **${prediction.toUpperCase()}** for **${amount.toLocaleString()}** 🪙${collectNote}`
+        `${emoji} **${interaction.user.username}** bet **${prediction.toUpperCase()}** for **${amount.toLocaleString()}** 🪙 @ **${multiplier}x** → win **${potential.toLocaleString()}** 🪙${collectNote}`
       );
     }
 
@@ -460,10 +466,12 @@ client.on('interactionCreate', async (interaction) => {
         if (user.coins < amount) {
           currentBetSkipReason = `💰 Not enough coins to bet on this match (have **${user.coins.toLocaleString()}** 🪙) — autobet saved for future games.`;
         } else {
+          const activeMult = predRaw === 'win' ? row.win_multiplier : row.lose_multiplier;
+          const multiplier = activeMult ?? (predRaw === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier);
           deductCoins(guildId, userId, amount);
-          placeBet(guildId, userId, matchId, row.puuid, predRaw, amount);
+          placeBet(guildId, userId, matchId, row.puuid, predRaw, amount, null, multiplier);
           currentBetPlaced = true;
-          fileLog.info('autobet: also placed bet on current match', { matchId, userId, puuid: row.puuid, predRaw, amount });
+          fileLog.info('autobet: also placed bet on current match', { matchId, userId, puuid: row.puuid, predRaw, amount, multiplier });
         }
       }
 

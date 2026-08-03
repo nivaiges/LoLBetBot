@@ -61,7 +61,21 @@ const config = {
   // Betting window (time after match detection to allow bets)
   bettingWindowMs: 5 * 60 * 1000, // 5 minutes
 
-  // Bet payout multipliers
+  // Moneyline odds
+  //   Multipliers are derived from The House's pWin estimate for each match:
+  //     WIN mult  = (1 - houseEdge) / pWin
+  //     LOSE mult = (1 - houseEdge) / (1 - pWin)
+  //   The favorite side pays less (safer), the underdog pays more (riskier).
+  //   `houseEdge` is a 5% cut so the coin economy slowly drains — same idea
+  //   as sportsbook vig. See computeMatchOdds() in src/poller.js.
+  houseEdge: 0.05,             // 5% vig baked into every multiplier
+  minWinMultiplier: 1.20,      // floor: even a heavy favorite pays at least 1.2x
+  maxWinMultiplier: 3.00,      // ceiling: caps runaway payouts on hopeless bets
+  minLoseMultiplier: 1.50,     // floor: LOSE side always beats a WIN safe bet
+  maxLoseMultiplier: 5.00,     // ceiling: no lottery-ticket LOSE payouts
+
+  // Legacy flat multipliers (fallback for pre-moneyline bets that have no
+  // stored multiplier). New bets store their own multiplier at placement.
   payoutMultiplier: 1.5,       // WIN bets pay 1.5x
   losePayoutMultiplier: 3,     // LOSE bets pay 3x
 

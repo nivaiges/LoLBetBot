@@ -25,9 +25,10 @@ export async function execute(interaction) {
 
     const correct = b.outcome === 'correct';
     const emoji = correct ? '✅' : '❌';
-    const multiplier = b.prediction === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier;
-    const payout = correct ? (b.amount * multiplier).toLocaleString() : '0';
-    return `${emoji} **${pred}** on ${player} — ${amount} 🪙 → ${correct ? `+${payout}` : 'lost'}`;
+    const multiplier = b.multiplier ?? (b.prediction === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier);
+    const payout = correct ? Math.floor(b.amount * multiplier).toLocaleString() : '0';
+    const multTag = b.multiplier != null ? ` @ ${b.multiplier}x` : '';
+    return `${emoji} **${pred}** on ${player} — ${amount} 🪙${multTag} → ${correct ? `+${payout}` : 'lost'}`;
   });
 
   const embed = new EmbedBuilder()

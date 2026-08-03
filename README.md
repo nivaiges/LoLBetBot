@@ -42,10 +42,11 @@ A Discord bot for betting on friends' League of Legends games using the Riot API
 - **Parlay V2** — ~17.5 % of matches roll a 2- to 4-leg prop bet. **Role-aware pool** of 18 legs (kills, deaths, assists, KDA, CS, gold, damage dealt/taken, vision, wards placed/killed, KP%, multi-kills, first blood, triple kill, won lane, win, game length) with per-role line ranges — supports get wards/vision/assists in the right ranges, junglers get elevated kill lines, ADCs get CS but not damage-taken, etc. **Parlay is a side-bet**: you must place a WIN or LOSE first before the parlay modal opens
 - **Auto-bets fire on next match** — Persistent across games until explicitly cleared with `/autobet … clear:True`
 - **The House** — automated rank-skill bettor that places a 1,000 🪙 bet on every match based on team-average LP delta; confidence % shown on the bet line
+- **Moneyline odds** — The House's `pWin` also drives the per-bet multiplier. WIN pays `(1 − houseEdge) / pWin`, LOSE pays `(1 − houseEdge) / (1 − pWin)`, both clamped to `[min, max]` (see config). The 5 % `houseEdge` is disclosed on the Match Detected card ("_includes 5% house edge_") — favorite side pays less, underdog pays more. Multipliers are **locked in at bet placement**, stored per-bet, and used at settle time — retuning odds later never changes an already-placed bet's payout
 - **5-minute betting window** — Bets close 5 min after match detection; buttons are stripped (or the whole Match Detected message replaced, depending on `/autodelete`)
 - **Remake handling** — Riot's `gameEndedInEarlySurrender` flag triggers a full bet refund with no W/L recorded
 - **Untracked-queue silent cancel** — Only Solo/Duo, Flex, Norms, ARAM, Clash, Quickplay, ARURF, OFA, URF are treated as "real" matches. Anything else (e.g. new ranked-5s mode Riot ships mid-season) still posts Match Detected so people see the game, but at match end the bot silently refunds bets and deletes the message — no Match Over post, no W/L recorded
-- **Auto-settle bets** — On match end the bot calls Match-V5, calculates payouts (WIN pays 1.5×, LOSE pays 3×, parlay pays 2ⁿ), updates user stats and achievements
+- **Auto-settle bets** — On match end the bot calls Match-V5, calculates payouts using the multiplier locked in at bet placement (moneyline; parlay still pays 2ⁿ), updates user stats and achievements
 - **Daily W/L** — Match results show the player's today's record, with 🔥 when above 50 %. Resets at local midnight (not UTC)
 - **Won lane** — At match end, the bot compares gold@14 vs the role opponent and increments `lane_wins` / `lane_losses` per tracked player. Shown in Match Over as ✓ Won Lane / ✕ Lost Lane with the gold-diff number
 - **Peak rank tracking** — Updates after every match; `/rank` shows distance from peak
@@ -242,8 +243,11 @@ sudo journalctl -u discord-bet-bot -f   # live logs
 | `collectCooldownMs` | 7,200,000 (2 h) | Time between collects |
 | `pollIntervalMs` | 60,000 (1 min) | How often to check Spectator-V5 |
 | `bettingWindowMs` | 300,000 (5 min) | Bet window after match detection |
-| `payoutMultiplier` | 1.5 | WIN bet payout |
-| `losePayoutMultiplier` | 3 | LOSE bet payout |
+| `houseEdge` | 0.05 | Vig baked into every moneyline multiplier (5% house cut) |
+| `minWinMultiplier` / `maxWinMultiplier` | 1.2 / 3.0 | Floor/ceiling on WIN payouts |
+| `minLoseMultiplier` / `maxLoseMultiplier` | 1.5 / 5.0 | Floor/ceiling on LOSE payouts |
+| `payoutMultiplier` | 1.5 | Legacy WIN payout — fallback only for pre-moneyline bets |
+| `losePayoutMultiplier` | 3 | Legacy LOSE payout — fallback only for pre-moneyline bets |
 | `parleyChance` | 0.175 | Probability of a parlay per match |
 | `parleyPayoutMultiplier` | 2 | Per-leg multiplier (total = 2ⁿ for n legs) |
 | `commandCooldownMs` | 5,000 | Per-user rate limit |
