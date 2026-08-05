@@ -12,8 +12,9 @@ export async function execute(interaction) {
     .setDescription([
       '`/collect` — Collect 10,000 coins (2h cooldown)',
       `\`/bet <win|lose> <amount> [player]\` — Bet on a match (moneyline; ${vigPct}% house edge)`,
-      '`/autobet [player] [prediction] [amount]` — Auto-bet every game (no args to view)',
-      '`/autobet player:Name#TAG clear:True` — Remove an auto-bet',
+      '`/autobet view` — Show your active auto-bets',
+      '`/autobet set player:Name#TAG prediction:win amount:5000` — Set/update an auto-bet',
+      '`/autobet clear player:Name#TAG` — Remove an auto-bet',
       '`/predict10 <player>` — Bet on their next 10-game win count via dropdowns (5×/2×/refund/half/0)',
       '`/predictions` — View your open /predict10 bets and progress',
       '`/give <@user> <amount>` — Give coins to another user',

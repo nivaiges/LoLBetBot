@@ -26,7 +26,9 @@ A Discord bot for betting on friends' League of Legends games using the Riot API
 
 ### Betting
 - `/bet <win|lose> <amount> [player]` — Bet on a tracked player's match (also available via buttons on match-detected embeds)
-- `/autobet [player] [prediction] [amount]` — Auto-bet on a player every game; persistent until cleared
+- `/autobet view` — Show your active auto-bets
+- `/autobet set player:Name#TAG prediction:win amount:5000` — Set (or update) an auto-bet; persistent until cleared
+- `/autobet clear player:Name#TAG` — Remove an auto-bet (player autocomplete lists only your active ones)
 
 ### Admin / Settings
 - `/bethere` — Set the current channel for betting notifications
@@ -40,7 +42,7 @@ A Discord bot for betting on friends' League of Legends games using the Riot API
 - **Betting buttons** — 🟢 WIN, 🔴 LOSE, 🟡 **Auto-bet**, and (when available) a 🎰 **Parlay** button. There's also a 🔗 u.gg multisearch link that opens all 10 players side-by-side
 - **Lane inference** — Team composition is ordered TOP → JUNGLE → MIDDLE → BOTTOM → UTILITY via Meraki play-rate optimization; the **smite carrier is hard-pinned to JUNGLE** so meta-flex picks (e.g. jungle Garen) can't be misassigned
 - **Parlay V2** — ~17.5 % of matches roll a 2- to 4-leg prop bet. **Role-aware pool** of 18 legs (kills, deaths, assists, KDA, CS, gold, damage dealt/taken, vision, wards placed/killed, KP%, multi-kills, first blood, triple kill, won lane, win, game length) with per-role line ranges — supports get wards/vision/assists in the right ranges, junglers get elevated kill lines, ADCs get CS but not damage-taken, etc. **Parlay is a side-bet**: you must place a WIN or LOSE first before the parlay modal opens
-- **Auto-bets fire on next match** — Persistent across games until explicitly cleared with `/autobet … clear:True`
+- **Auto-bets fire on next match** — Persistent across games until explicitly cleared with `/autobet clear player:Name#TAG`
 - **The House** — automated rank-skill bettor that places a 1,000 🪙 bet on every match based on team-average LP delta; confidence % shown on the bet line
 - **Moneyline odds** — The House's `pWin` also drives the per-bet multiplier. WIN pays `(1 − houseEdge) / pWin`, LOSE pays `(1 − houseEdge) / (1 − pWin)`, both clamped to `[min, max]` (see config). The 5 % `houseEdge` is disclosed on the Match Detected card ("_includes 5% house edge_") — favorite side pays less, underdog pays more. Multipliers are **locked in at bet placement**, stored per-bet, and used at settle time — retuning odds later never changes an already-placed bet's payout
 - **5-minute betting window** — Bets close 5 min after match detection; buttons are stripped (or the whole Match Detected message replaced, depending on `/autodelete`)
