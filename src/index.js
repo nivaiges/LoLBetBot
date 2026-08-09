@@ -28,6 +28,7 @@ import {
 import config from '../config.js';
 import { getAccountByRiotId } from './riot.js';
 import { isBettingOpen } from './utils/bettingwindow.js';
+import { formatAmericanOdds } from './utils/moneyline.js';
 import { loadSounds, playJoinSound } from './joinSound.js';
 
 // Import commands
@@ -376,6 +377,7 @@ client.on('interactionCreate', async (interaction) => {
       const activeMult = prediction === 'win' ? match.win_multiplier : match.lose_multiplier;
       const multiplier = activeMult ?? (prediction === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier);
       const potential = Math.floor(amount * multiplier);
+      const american = formatAmericanOdds(multiplier);
 
       // Last-bet-wins: any prior bet on this match (autobet, /bet, or a prior
       // button click) is refunded and replaced by this one. Balance check is
@@ -412,7 +414,7 @@ client.on('interactionCreate', async (interaction) => {
         ? ` _(replaced prior ${existing.prediction.toUpperCase()} ${priorRefund.toLocaleString()} 🪙)_`
         : '';
       return interaction.reply(
-        `${emoji} **${interaction.user.username}** bet **${prediction.toUpperCase()}** for **${amount.toLocaleString()}** 🪙 @ **${multiplier}x** → win **${potential.toLocaleString()}** 🪙${priorTag}${collectNote}`
+        `${emoji} **${interaction.user.username}** bet **${prediction.toUpperCase()}** for **${amount.toLocaleString()}** 🪙 @ **${multiplier}x** (${american}) → win **${potential.toLocaleString()}** 🪙${priorTag}${collectNote}`
       );
     }
 

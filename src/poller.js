@@ -7,6 +7,7 @@ import { getActiveGame, getMatchResult, getMatchTimeline, getRankedStatsByPuuid,
 import { computeTeamGoldLead, extractObjectiveEvents, computeWonLane, extractTrackedPlayerKills, renderTeamsCompositePng, renderMatchOverPng, renderMatchOverScoreboardPng, renderMatchOverImpactPng } from './matchGraph.js';
 import { loadPlayRates, inferLanes } from './utils/laneInfer.js';
 import { registerBettingWindow } from './utils/bettingwindow.js';
+import { formatAmericanOdds } from './utils/moneyline.js';
 import {
   getAllTrackedPlayers,
   upsertActiveMatch,
@@ -684,16 +685,19 @@ async function checkForNewMatches() {
         // Render failed — fall back to a text-only Match Detected.
         sendPayload.content = `⚔ **MATCH DETECTED** — ${name}${trackedChamp ? ` on ${trackedChamp}` : ''}`;
       }
-      // Moneyline banner — favorite/underdog + per-side multipliers.
-      // `Payouts include a ${vig}% house edge.` disclosure kept short.
+      // Moneyline banner — favorite/underdog + per-side multipliers, with
+      // American odds in parens so the +/- asymmetry is visually loud.
       if (odds) {
         const favSide = odds.favorite === 'win' ? '🟢 WIN' : '🔴 LOSE';
         const pct = Math.round(odds.pWin * 100);
         const favPct = odds.favorite === 'win' ? pct : 100 - pct;
         const vigPct = Math.round(config.houseEdge * 100);
+        const winAm  = formatAmericanOdds(odds.winMult);
+        const loseAm = formatAmericanOdds(odds.loseMult);
         const moneyline =
           `📊 **Moneyline** — favorite: ${favSide} (${favPct}%) · ` +
-          `WIN pays **${odds.winMult}x** · LOSE pays **${odds.loseMult}x** ` +
+          `WIN **${odds.winMult}x** (${winAm}) · ` +
+          `LOSE **${odds.loseMult}x** (${loseAm}) ` +
           `_(includes ${vigPct}% house edge)_`;
         sendPayload.content = sendPayload.content
           ? `${moneyline}\n${sendPayload.content}`

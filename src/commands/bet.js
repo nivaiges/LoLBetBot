@@ -13,6 +13,7 @@ import {
 import { isBettingOpen } from '../utils/bettingwindow.js';
 import config from '../../config.js';
 import { displayTag } from '../utils/displayName.js';
+import { formatAmericanOdds } from '../utils/moneyline.js';
 
 function tryAutoCollect(guildId, userId, user) {
   const now = new Date();
@@ -108,6 +109,7 @@ export async function execute(interaction) {
   const activeMult = prediction === 'win' ? match.win_multiplier : match.lose_multiplier;
   const multiplier = activeMult ?? (prediction === 'win' ? config.payoutMultiplier : config.losePayoutMultiplier);
   const potential = Math.floor(amount * multiplier);
+  const american = formatAmericanOdds(multiplier);
 
   // Check existing bet — allow updating during betting window
   const existingBet = getUserBetOnMatch(guildId, userId, match.match_id);
@@ -127,7 +129,7 @@ export async function execute(interaction) {
       ? ` (changed from ${existingBet.prediction.toUpperCase()})`
       : '';
     return interaction.reply(
-      `Bet updated: **${prediction.toUpperCase()}** on **${displayTag(target.riot_tag)}** for **${amount.toLocaleString()}** coins @ **${multiplier}x** → win **${potential.toLocaleString()}** 🪙${changed}. (was ${existingBet.amount.toLocaleString()} coins)`
+      `Bet updated: **${prediction.toUpperCase()}** on **${displayTag(target.riot_tag)}** for **${amount.toLocaleString()}** coins @ **${multiplier}x** (${american}) → win **${potential.toLocaleString()}** 🪙${changed}. (was ${existingBet.amount.toLocaleString()} coins)`
     );
   }
 
@@ -137,6 +139,6 @@ export async function execute(interaction) {
 
   const collectNote = autoCollected ? `\n🪙 Auto-collected **${config.collectAmount.toLocaleString()}** coins!` : '';
   return interaction.reply(
-    `Bet placed: **${prediction.toUpperCase()}** on **${displayTag(target.riot_tag)}** for **${amount.toLocaleString()}** coins @ **${multiplier}x** → win **${potential.toLocaleString()}** 🪙.${collectNote}`
+    `Bet placed: **${prediction.toUpperCase()}** on **${displayTag(target.riot_tag)}** for **${amount.toLocaleString()}** coins @ **${multiplier}x** (${american}) → win **${potential.toLocaleString()}** 🪙.${collectNote}`
   );
 }
