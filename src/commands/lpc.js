@@ -1,8 +1,7 @@
-import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
+import { SlashCommandBuilder } from 'discord.js';
 import { getTrackedPlayers, getTrackedPlayerByTag, getLpHistory } from '../db.js';
-import { renderLpComparePng, compareColor } from '../matchGraph.js';
-import { displayTag, displayName } from '../utils/displayName.js';
-import { rankLabel } from '../utils/rankMath.js';
+import { renderLpComparePng } from '../matchGraph.js';
+import { displayTag } from '../utils/displayName.js';
 
 const MAX_PLAYERS = 10;
 const SLOT_COUNT = 8;
@@ -82,32 +81,14 @@ export async function execute(interaction) {
     return interaction.reply({ content: 'Need at least 2 players with LP history to compare.', ephemeral: true });
   }
 
-  const png = await renderLpComparePng(withHistory, { title: 'LP Comparison' });
+  const png = await renderLpComparePng(withHistory, { title: 'LP COMPARISON' });
   if (!png) {
     return interaction.reply({ content: '❌ Failed to render comparison.', ephemeral: true });
   }
 
-  // Legend: colored dot + name + current rank
-  const legend = withHistory.map((p, i) => {
-    const last = p.entries[p.entries.length - 1];
-    const dot = compareDot(i);
-    return `${dot} **${displayName(p.riotTag)}** — ${rankLabel(last.tier, last.rank, last.lp)} (${p.entries.length} entries)`;
-  }).join('\n');
-
-  const embed = new EmbedBuilder()
-    .setTitle(`📊 LP Comparison — ${withHistory.length} players`)
-    .setDescription(legend)
-    .setColor(0x3498db)
-    .setImage('attachment://lp-compare.png');
-
+  // No embed — the PNG carries its own header + per-player legend chips, so
+  // Discord renders the attachment at full native size.
   return interaction.reply({
-    embeds: [embed],
     files: [{ attachment: png, name: 'lp-compare.png' }],
   });
-}
-
-// Map compareColor() hex to the closest Unicode color dot for the legend.
-const COLOR_DOTS = ['🔵', '🟢', '🟠', '🟣', '🔴', '🟡'];
-function compareDot(i) {
-  return COLOR_DOTS[i % COLOR_DOTS.length];
 }

@@ -1570,31 +1570,128 @@ export function compareColor(i) {
 export async function renderLpComparePng(players, opts = {}) {
   if (!players?.length) return null;
   const valid = players.filter(p => p.entries?.length);
-  if (!valid.length) return null;
+  if (valid.length < 2) return null;
 
-  const { title = 'LP Comparison' } = opts;
+  const { title = 'LP COMPARISON' } = opts;
 
   try {
-    const W = 520;
-    const H = 220;
-    const padL = 56;
-    const padR = 14;
-    const padT = 28;
-    const padB = 22;
-    const plotW = W - padL - padR;
-    const plotH = H - padT - padB;
+    // ── Layout — mirrors /rank's 920×2x visual language ──────────────────
+    const SCALE = 2;
+    const W = 920;
+    const padX = 18;
 
-    const canvas = createCanvas(W, H);
+    // Header
+    const headerH = 72;
+
+    // Legend chips — up to 5 per row, wrap if more
+    const chipsPerRow = Math.min(valid.length, 5);
+    const legendRows  = Math.ceil(valid.length / 5);
+    const chipH   = 62;
+    const chipGap = 10;
+    const legendH = legendRows * chipH + Math.max(0, legendRows - 1) * chipGap;
+
+    // Chart card
+    const cardGap     = 14;
+    const chartCardH  = 460;
+    const padBottom   = 22;
+    const H = headerH + legendH + cardGap + chartCardH + padBottom;
+
+    const canvas = createCanvas(W * SCALE, H * SCALE);
     const ctx = canvas.getContext('2d');
+    ctx.scale(SCALE, SCALE);
 
-    ctx.fillStyle = BG;
+    // Diagonal navy gradient — same palette as renderRankLadderPng.
+    const bgGrad = ctx.createLinearGradient(0, 0, W, H);
+    bgGrad.addColorStop(0, '#181b22');
+    bgGrad.addColorStop(1, '#0f1118');
+    ctx.fillStyle = bgGrad;
     ctx.fillRect(0, 0, W, H);
 
-    ctx.fillStyle = TITLE;
-    ctx.font = `bold 13px ${FONT_STACK}`;
-    ctx.textBaseline = 'top';
+    // ── Header — 📊 + title + player count ─────────────────────────────────
     ctx.textAlign = 'left';
-    ctx.fillText(title, padL, 8);
+    ctx.textBaseline = 'alphabetic';
+    const headerBaselineY = 52;
+    ctx.fillStyle = '#5DADE2';
+    ctx.font = `900 34px ${FONT_STACK}`;
+    ctx.fillText('📊', padX, headerBaselineY);
+    ctx.fillStyle = '#fff';
+    ctx.font = `900 30px ${FONT_STACK}`;
+    ctx.fillText(title, padX + 46, headerBaselineY);
+    // subtitle: N players — right of the title
+    const titleW = ctx.measureText(title).width;
+    ctx.fillStyle = '#7a818c';
+    ctx.font = `15px ${FONT_STACK}`;
+    ctx.fillText(`· ${valid.length} players`, padX + 46 + titleW + 12, headerBaselineY);
+
+    // ── Legend chips ───────────────────────────────────────────────────────
+    // Chip: left color strip · name · current rank · delta-from-start
+    const chipsAreaW = W - padX * 2;
+    const chipW = (chipsAreaW - chipGap * (chipsPerRow - 1)) / chipsPerRow;
+    for (let i = 0; i < valid.length; i++) {
+      const p = valid[i];
+      const color = compareColor(i);
+      const row = Math.floor(i / 5);
+      const col = i % 5;
+      const cx = padX + col * (chipW + chipGap);
+      const cy = headerH + row * (chipH + chipGap);
+
+      // Card background
+      ctx.fillStyle = '#1d2029';
+      roundRect(ctx, cx, cy, chipW, chipH, 8);
+      ctx.fill();
+      // Left color strip
+      ctx.fillStyle = color;
+      roundRect(ctx, cx, cy, 4, chipH, 2);
+      ctx.fill();
+
+      // Name (top row)
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = '#fff';
+      ctx.font = `bold 15px ${FONT_STACK}`;
+      const nameStr = fitText(ctx, displayName(p.riotTag), chipW - 24);
+      ctx.fillText(nameStr, cx + 14, cy + 24);
+
+      // Current rank (bottom row, colored)
+      const last  = p.entries[p.entries.length - 1];
+      const first = p.entries[0];
+      const currAbs  = toAbsoluteLP(last.tier,  last.rank,  last.lp)  || 0;
+      const startAbs = toAbsoluteLP(first.tier, first.rank, first.lp) || 0;
+      const delta = currAbs - startAbs;
+
+      ctx.fillStyle = color;
+      ctx.font = `bold 13px ${FONT_STACK}`;
+      const rankStr = rankLabel(last.tier, last.rank, last.lp);
+      ctx.fillText(rankStr, cx + 14, cy + 46);
+      const rankW = ctx.measureText(rankStr).width;
+
+      // Delta pill on the same line (only when the player actually moved).
+      if (delta !== 0) {
+        const positive = delta > 0;
+        ctx.fillStyle = positive ? '#3ba55d' : '#ed4245';
+        ctx.font = `bold 12px ${FONT_STACK}`;
+        ctx.fillText(`${positive ? '▲' : '▼'} ${Math.abs(delta)}`, cx + 14 + rankW + 10, cy + 46);
+      }
+    }
+
+    // ── Chart card ─────────────────────────────────────────────────────────
+    const cardY = headerH + legendH + cardGap;
+    const cardX = padX;
+    const cardW = W - padX * 2;
+    ctx.fillStyle = '#1d2029';
+    roundRect(ctx, cardX, cardY, cardW, chartCardH, 12);
+    ctx.fill();
+
+    // Plot area within the card. Left pad leaves room for the rank Y-axis
+    // labels + rotated 'ABSOLUTE LP' caption; right pad holds tier band tags.
+    const cPadL = 68;
+    const cPadR = 78;
+    const cPadT = 22;
+    const cPadB = 40;
+    const plotX = cardX + cPadL;
+    const plotY = cardY + cPadT;
+    const plotW = cardW - cPadL - cPadR;
+    const plotH = chartCardH - cPadT - cPadB;
 
     // Y range across all players
     let minVal = Infinity, maxVal = -Infinity;
@@ -1608,9 +1705,9 @@ export async function renderLpComparePng(players, opts = {}) {
     }
     if (!Number.isFinite(minVal)) return null;
     const span = Math.max(50, maxVal - minVal);
-    const pad = Math.max(25, span * 0.1);
-    let yMin = Math.max(0, Math.floor((minVal - pad) / 50) * 50);
-    const yMax = Math.ceil((maxVal + pad) / 50) * 50;
+    const yPad = Math.max(25, span * 0.1);
+    let yMin = Math.max(0, Math.floor((minVal - yPad) / 50) * 50);
+    const yMax = Math.ceil((maxVal + yPad) / 50) * 50;
 
     // Extend yMin to include at least half of the band below (same as /lp)
     const playerBandIdx = TIER_BANDS.findIndex(b => minVal >= b.min && minVal < b.max);
@@ -1620,7 +1717,7 @@ export async function renderLpComparePng(players, opts = {}) {
       yMin = Math.min(yMin, targetMin);
     }
     const yRange = yMax - yMin || 1;
-    const yPx = v => padT + plotH * (yMax - v) / yRange;
+    const yPx = v => plotY + plotH * (yMax - v) / yRange;
 
     // Time range (X-axis)
     const parseTs = s => {
@@ -1638,9 +1735,9 @@ export async function renderLpComparePng(players, opts = {}) {
     }
     if (!Number.isFinite(tMin) || tMin === tMax) tMax = tMin + 1;
     const tSpan = tMax - tMin;
-    const xPx = t => padL + plotW * (t - tMin) / tSpan;
+    const xPx = t => plotX + plotW * (t - tMin) / tSpan;
 
-    // Tier bands
+    // Tier bands (subtle, opacity from TIER_BANDS)
     for (const band of TIER_BANDS) {
       const lo = Math.max(band.min, yMin);
       const hi = Math.min(band.max, yMax);
@@ -1648,50 +1745,65 @@ export async function renderLpComparePng(players, opts = {}) {
       const yTop = yPx(hi);
       const yBot = yPx(lo);
       ctx.fillStyle = band.color;
-      ctx.fillRect(padL, yTop, plotW, yBot - yTop);
-      if (yBot - yTop > 14) {
-        ctx.fillStyle = 'rgba(255,255,255,0.22)';
-        ctx.font = `9px ${FONT_STACK}`;
-        ctx.textAlign = 'right';
-        ctx.textBaseline = 'top';
-        ctx.fillText(band.name, W - padR - 3, yTop + 2);
+      ctx.fillRect(plotX, yTop, plotW, yBot - yTop);
+      if (yBot - yTop > 18) {
+        // Band name in a right-margin gutter — brighter/bolder than the old
+        // 9px grey so it competes with the plot.
+        ctx.fillStyle = 'rgba(255,255,255,0.35)';
+        ctx.font = `bold 11px ${FONT_STACK}`;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(band.name.toUpperCase(), plotX + plotW + 8, (yTop + yBot) / 2);
       }
     }
 
     // Tier boundary dashed lines
-    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
     ctx.lineWidth = 1;
     ctx.setLineDash([4, 3]);
     for (const band of TIER_BANDS) {
       if (band.min > yMin && band.min < yMax) {
         const py = yPx(band.min);
         ctx.beginPath();
-        ctx.moveTo(padL, py);
-        ctx.lineTo(W - padR, py);
+        ctx.moveTo(plotX, py);
+        ctx.lineTo(plotX + plotW, py);
         ctx.stroke();
       }
     }
     ctx.setLineDash([]);
 
-    // Y-tick labels
+    // Y-tick labels — bigger + brighter than the /lp mini version
     const niceStep = niceLpStep(yRange);
-    ctx.fillStyle = AXIS;
-    ctx.font = `11px ${FONT_STACK}`;
+    ctx.fillStyle = '#9aa3bd';
+    ctx.font = `12px ${FONT_STACK}`;
     ctx.textAlign = 'right';
     ctx.textBaseline = 'middle';
     for (let v = Math.ceil(yMin / niceStep) * niceStep; v <= yMax; v += niceStep) {
-      ctx.fillText(v.toString(), padL - 6, yPx(v));
+      ctx.fillText(String(v), plotX - 8, yPx(v));
     }
 
-    // One line + dots per player. Lines drawn first so peak rings/callouts
-    // (drawn in a second pass below) always sit on top of every line.
+    // X-axis date ticks — 4 evenly spaced M/D labels along the plot bottom.
+    ctx.fillStyle = '#9aa3bd';
+    ctx.font = `11px ${FONT_STACK}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    const nDateTicks = 4;
+    for (let i = 0; i <= nDateTicks; i++) {
+      const t = tMin + (tSpan * i) / nDateTicks;
+      const d = new Date(t);
+      ctx.fillText(`${d.getMonth() + 1}/${d.getDate()}`, xPx(t), plotY + plotH + 10);
+    }
+
+    // ── Per-player lines ────────────────────────────────────────────────
+    // Lines drawn first so peak rings/callouts sit on top of every line.
     const peakMarks = [];
+    const endMarks  = [];
     for (let pi = 0; pi < valid.length; pi++) {
       const p = valid[pi];
       const color = compareColor(pi);
       const pts = [];
-      let peak = null; // { abs, entry, point }
-      let pit = null;  // { abs, entry, point } — lowest LP reached
+      let peak = null; // highest LP reached
+      let pit  = null; // lowest  LP reached
       for (const e of p.entries) {
         const abs = toAbsoluteLP(e.tier, e.rank, e.lp);
         const t = parseTs(e.recorded_at);
@@ -1699,27 +1811,29 @@ export async function renderLpComparePng(players, opts = {}) {
         const pt = { x: xPx(t), y: yPx(abs) };
         pts.push(pt);
         if (!peak || abs > peak.abs) peak = { abs, entry: e, point: pt };
-        if (!pit || abs < pit.abs) pit = { abs, entry: e, point: pt };
+        if (!pit  || abs < pit.abs)  pit  = { abs, entry: e, point: pt };
       }
       if (pts.length === 0) continue;
 
+      // Line — 3px, rounded joins so single-point kinks stay smooth.
       ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 3;
+      ctx.lineJoin = 'round';
+      ctx.lineCap  = 'round';
       ctx.beginPath();
       ctx.moveTo(pts[0].x, pts[0].y);
       for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
       ctx.stroke();
 
-      // Carry-forward: if this player hasn't logged a point at the global
-      // tMax, extend a faint dashed plateau from their last point to the right
-      // edge so every line ends at the same x.
+      // Carry-forward: extend a faint dashed plateau to the right edge so
+      // every line ends at the same x — reads as "still at this LP now".
       const lastEntry = p.entries[p.entries.length - 1];
       const lastT = parseTs(lastEntry?.recorded_at);
       if (lastT != null && lastT < tMax) {
         const lastPt = pts[pts.length - 1];
         ctx.save();
-        ctx.globalAlpha = 0.45;
-        ctx.setLineDash([4, 3]);
+        ctx.globalAlpha = 0.4;
+        ctx.setLineDash([5, 4]);
         ctx.strokeStyle = color;
         ctx.lineWidth = 2;
         ctx.beginPath();
@@ -1729,44 +1843,58 @@ export async function renderLpComparePng(players, opts = {}) {
         ctx.restore();
       }
 
-      // Dots only at the peak and pit (highest / lowest LP for this player).
-      ctx.fillStyle = color;
-      const dotPoints = [];
-      if (peak) dotPoints.push(peak.point);
-      if (pit && pit.point !== peak?.point) dotPoints.push(pit.point);
-      for (const pt of dotPoints) {
+      // Pit dot (subtle — no ring, no callout; peak gets the star treatment).
+      if (pit && pit.point !== peak?.point) {
+        ctx.fillStyle = color;
         ctx.beginPath();
-        ctx.arc(pt.x, pt.y, 3, 0, Math.PI * 2);
+        ctx.arc(pit.point.x, pit.point.y, 3, 0, Math.PI * 2);
         ctx.fill();
       }
 
       if (peak) peakMarks.push({ pi, color, peak });
+      endMarks.push({ pi, color, point: pts[pts.length - 1] });
     }
 
-    // Per-player peak callouts — ring + pill with the rank label. Stagger
-    // upward by player index so two peaks at similar Y/X don't overlap.
+    // Peak markers — ring + pill callout above. Stagger upward by index so
+    // two peaks with nearby (x,y) don't overlap.
     for (const m of peakMarks) {
       const { color, peak, pi } = m;
       const { point, entry } = peak;
       ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 2.5;
       ctx.beginPath();
-      ctx.arc(point.x, point.y, 4.5, 0, Math.PI * 2);
+      ctx.arc(point.x, point.y, 6, 0, Math.PI * 2);
       ctx.stroke();
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, 3, 0, Math.PI * 2);
+      ctx.fill();
 
-      const labelY = Math.max(padT + 10, point.y - 8 - pi * 14);
-      drawCallout(ctx, point.x, labelY, rankLabel(entry.tier, entry.rank, entry.lp), color, 'above', W, padR, H);
+      const labelY = Math.max(plotY + 12, point.y - 12 - pi * 16);
+      drawCallout(ctx, point.x, labelY, rankLabel(entry.tier, entry.rank, entry.lp), color, 'above', cardX + cardW, cPadR, cardY + chartCardH);
     }
 
-    // Y-axis label
+    // End-of-line dots — one per player, drawn last so they sit on top of
+    // any crossings. Thin dark outline separates them from the tier bands.
+    for (const m of endMarks) {
+      ctx.fillStyle = m.color;
+      ctx.beginPath();
+      ctx.arc(m.point.x, m.point.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#1d2029';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    // ── Rotated Y-axis caption ────────────────────────────────────────────
     ctx.save();
-    ctx.translate(14, padT + plotH / 2);
+    ctx.translate(cardX + 20, plotY + plotH / 2);
     ctx.rotate(-Math.PI / 2);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillStyle = AXIS;
-    ctx.font = `11px ${FONT_STACK}`;
-    ctx.fillText('LP', 0, 0);
+    ctx.fillStyle = '#7a818c';
+    ctx.font = `bold 12px ${FONT_STACK}`;
+    ctx.fillText('ABSOLUTE LP', 0, 0);
     ctx.restore();
 
     return canvas.toBuffer('image/png');
