@@ -69,6 +69,13 @@ Every Match Over message ships **three attachments** that Discord auto-arranges 
 
 - **📌 Keep in Chat** button — re-posts the composite as a standalone message that survives the auto-clear (see *Save / Keep* below)
 
+**Example splash cards from two solo games:**
+
+| Victory | Defeat |
+| :---: | :---: |
+| <img src="assets/screenshots/match-over-victory.png" alt="Match Over splash card: Nivy on Pyke, 5/1/19 victory, Won Lane +925. The House and niv WIN bets paid out and the gold lead climbs to +15.6k at 23m." width="420"> | <img src="assets/screenshots/match-over-defeat.png" alt="Match Over splash card: Mich on Sylas, 4/6/4 defeat, Lost Lane -1.4k. jaco's LOSE bet paid out, the WIN bets lost, and the gold lead falls to -11.1k at 25m." width="420"> |
+| Nivy on Pyke, 5/1/19. Both WIN bets paid out. | Mich on Sylas, 4/6/4. The LOSE bet paid out and both WIN bets lost. |
+
 ### LP Profile card (`/lp`)
 
 Full profile card per player. Captures an LP snapshot on every match end + `/rank` call (skips duplicates when LP/tier hasn't changed). Layout:
